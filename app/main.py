@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
-from uuid import UUID, uuid4
-from datetime import datetime
+from .database import SessionLocal
+from .models import SupportQuery
 
 
 app = FastAPI(title = "SupportIq")
@@ -9,9 +9,8 @@ app = FastAPI(title = "SupportIq")
 #**structure what we get from customer**
 
 class SupportRequest(BaseModel):
-    customer_id : str = Field(min_length = 1)
-    email : str
-    message : str = Field(min_length = 5 , max_length = 500)
+    customer_email : str
+    question : str = Field(min_length = 1 , max_length = 500)
 
 
 #temporary store the queries later we integrate with PostgreSQL
@@ -24,15 +23,16 @@ def home():
 # to create  unique query_id 
 @app.post("/queries", status_code = 202)
 def create_query(request: SupportRequest):
-    query_id = str(uuid4())
+    db = SessionLocal()
+    query = SupportQuery(question= request.question,
+                         customer_email=request.customer_email)
 
-    queries[query_id] = {
-        "customer_id":request.customer_id,
-        "email":request.email,
-        "message": request.message,
-        "status": "pending",
-        "created_at":datetime.utcnow().isoformat(),
-    }
+    db.add(query)
+    db.commit()
+    db.refresh(query)
+    db.close()
 
-    return {"query_id":query_id, "status":"pending"}
 
+    return {"query_id":str(query.id), "status":query.status}
+
+    
