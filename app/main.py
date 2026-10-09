@@ -1,5 +1,6 @@
 from datetime import datetime
 from uuid import UUID
+from enum import Enum
 
 from fastapi import FastAPI,Depends,HTTPException
 from pydantic import BaseModel, Field
@@ -21,8 +22,14 @@ class QueryResponse(BaseModel):
     status: str
     created_at:datetime
 
+class QueryStatus(str,Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    RESOLVED = "Resolved"
+    CLOSED = "closed"
+
 class QueryUpdate(BaseModel):
-    status: str
+    status: QueryStatus
 
 
 
