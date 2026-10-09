@@ -4,8 +4,10 @@ from enum import Enum
 
 from fastapi import FastAPI,Depends,HTTPException
 from pydantic import BaseModel, Field
+
+from app.ai_service import generate_support_response
 from .database import SessionLocal
-from .models import SupportQuery
+from .models import SupportQuery , Support_Answer
 from sqlalchemy import select
 
 app = FastAPI(title = "SupportIq")
@@ -49,6 +51,16 @@ def create_query(request: SupportRequest,db = Depends(get_db)):
     db.add(query)
     db.commit()
     db.refresh(query)
+
+    # !Generate an Ai response
+    generate_text = generate_support_response(query.question)
+
+    # **create object of Suppoert_Answer to create an answer linked with saved query
+    answer = Support_Answer(query_id = query.id, answer_text= generate_text)
+    db.add(answer)
+    db.commit()
+    db.refresh(answer)
+
     return {
     "query_id": query.id,
     "question": query.question,
