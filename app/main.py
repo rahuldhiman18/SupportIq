@@ -7,8 +7,9 @@ from pydantic import BaseModel, Field
 
 from app.ai_service import generate_support_response
 from .database import SessionLocal
-from .models import SupportQuery , Support_Answer
+from .models import SupportQuery , Support_Answer , KnowledgeAnswer , KnowledgeAnswerVersion
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 app = FastAPI(title = "SupportIq")
 
@@ -32,6 +33,22 @@ class QueryStatus(str,Enum):
 
 class QueryUpdate(BaseModel):
     status: QueryStatus
+
+
+class KnowledgeCreate(BaseModel):
+    canonical_question :str = Field(min_length=1 , max_length=500)
+    answer_text:str = Field(min_length=1 , max_length=5000)
+    source_url:str = Field(min_length = 1, max_length= 2000)
+
+class KnowledgeDraftResponse(BaseModel):
+    knowledge_answer_id : UUID
+    version_id : UUID
+    canonical_question : str
+    answer_text: str
+    source_url : str
+    status : str
+    version_number: int
+
 
 
 
@@ -95,7 +112,48 @@ def update_query(query_id:UUID, request:QueryUpdate, db = Depends(get_db)):
             "status":query.status,
             "created_at":query.created_at
             }
-    
+
+
+@app.post("/knowledge",status_code=201)
+def create_knowledge(request: KnowledgeCreate,db: Session = Depends(get_db),):
+    knowledge = KnowledgeAnswer(canonical_question = request.canonical_question,
+    source_url = request.source_url,
+    is_active = False,)
+    try:
+        db.add(knowledge)
+        db.flush()
+        
+        
+        version = KnowledgeAnswerVersion(
+            knowledge_answer_id=knowledge.id,
+            version_number=1,
+            answer_text=request.answer_text,
+            status="draft",
+            is_current=False,
+            approved_by=None,
+            approved_at=None,
+        )
+
+
+        db.add(version)
+        db.commit()
+        db.refresh(knowledge)
+        db.refresh(version)
+
+        return {
+            "knowledge_answer_id": knowledge.id,
+            "version_id": version.id,
+            "canonical_question": knowledge.canonical_question,
+            "answer_text": version.answer_text,
+            "source_url": knowledge.source_url,
+            "status": version.status,
+            "version_number": version.version_number,
+        }
+
+    except Exception:
+        db.rollback()
+        raise 
+
 
     
     

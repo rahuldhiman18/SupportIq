@@ -32,7 +32,7 @@ class KnowledgeAnswer(Base):
     canonical_question: Mapped[str] = mapped_column(String,nullable=False)
     is_active: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone =True),default=lambda:datetime.now(timezone.utc))
-
+    source_url: Mapped[str] = mapped_column(String, nullable=False)
 
 class KnowledgeAnswerVersion(Base):
     __tablename__="knowledge_answer_versions"
