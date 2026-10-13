@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from app.ai_service import generate_support_response
 from .database import SessionLocal
 from .models import SupportQuery , Support_Answer , KnowledgeAnswer , KnowledgeAnswerVersion
-from sqlalchemy import select
+from sqlalchemy import select, desc
 from sqlalchemy.orm import Session
 
 app = FastAPI(title = "SupportIq")
@@ -48,6 +48,12 @@ class KnowledgeDraftResponse(BaseModel):
     source_url : str
     status : str
     version_number: int
+
+class AnswerResponse(BaseModel):
+    id: UUID
+    query_id: UUID
+    answer_text: str
+    created_at: datetime
 
 
 
@@ -112,6 +118,23 @@ def update_query(query_id:UUID, request:QueryUpdate, db = Depends(get_db)):
             "status":query.status,
             "created_at":query.created_at
             }
+
+
+@app.get("/queries/{query_id}/answer", response_model=AnswerResponse)
+def get_latest_answer(query_id: UUID, db: Session = Depends(get_db)):
+    # Find answers for this query, newest first
+    stmt = (
+        select(Support_Answer)
+        .where(Support_Answer.query_id == query_id)
+        .order_by(desc(Support_Answer.created_at))
+    )
+    result = db.execute(stmt)
+    answer = result.scalars().first()
+
+    if not answer:
+        raise HTTPException(status_code=404, detail="No answer found for this query yet.")
+
+    return answer
 
 
 @app.post("/knowledge",status_code=201)
