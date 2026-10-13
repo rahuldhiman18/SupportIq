@@ -1,11 +1,17 @@
-from datetime import datetime
+from datetime import datetime, date
 from uuid import UUID
 from enum import Enum
 
 from fastapi import FastAPI,Depends,HTTPException
 from pydantic import BaseModel, Field
 
-from app.ai_service import generate_support_response
+from app.ai_service import (
+    answer_customer_question,
+    AITimeoutError,
+    AIRateLimitError,
+    AIProviderError,
+    AIContentBlockedError,
+)
 from .database import SessionLocal
 from .models import SupportQuery , Support_Answer , KnowledgeAnswer , KnowledgeAnswerVersion
 from sqlalchemy import select, desc
@@ -18,17 +24,21 @@ app = FastAPI(title = "SupportIq")
 class SupportRequest(BaseModel):
     customer_email : str
     question : str = Field(min_length = 1 , max_length = 500)
+    # Optional situation details -> lets the AI personalize (e.g. eligibility math)
+    purchase_date: date | None = None
+    order_status: str | None = Field(default=None, max_length=50)
 
 class QueryResponse(BaseModel):
     query_id:UUID
     question: str
     status: str
     created_at:datetime
+    intent: str | None = None
 
 class QueryStatus(str,Enum):
     PENDING = "pending"
     PROCESSING = "processing"
-    RESOLVED = "Resolved"
+    RESOLVED = "resolved"
     CLOSED = "closed"
 
 class QueryUpdate(BaseModel):
@@ -75,8 +85,46 @@ def create_query(request: SupportRequest,db = Depends(get_db)):
     db.commit()
     db.refresh(query)
 
-    # !Generate an Ai response
-    generate_text = generate_support_response(query.question)
+    # **Find the current approved knowledge version (source of truth), if any
+    knowledge_version = db.execute(
+        select(KnowledgeAnswerVersion)
+        .where(KnowledgeAnswerVersion.is_current.is_(True))
+    ).scalars().first()
+
+    if knowledge_version:
+        query.knowledge_version_id = knowledge_version.id
+        db.commit()
+        db.refresh(query)
+
+    # !Generate an intent-aware Ai response, grounded in the knowledge base
+    # Map typed AI errors to proper HTTP statuses (instead of raw 500s)
+    situation_parts = []
+    if request.purchase_date:
+        days_ago = (date.today() - request.purchase_date).days
+        situation_parts.append(
+            f"purchased {days_ago} days ago (on {request.purchase_date.isoformat()})"
+        )
+    if request.order_status:
+        situation_parts.append(f"order status: {request.order_status}")
+    situation = "; ".join(situation_parts) or None
+
+    try:
+        result = answer_customer_question(
+            query.question,
+            policy_context=knowledge_version.answer_text if knowledge_version else None,
+            situation=situation,
+        )
+    except AIRateLimitError:
+        raise HTTPException(status_code=429, detail="AI is busy, please try again shortly")
+    except AITimeoutError:
+        raise HTTPException(status_code=504, detail="AI timed out, please try again")
+    except (AIContentBlockedError, AIProviderError):
+        raise HTTPException(status_code=502, detail="Could not generate an answer right now")
+
+    generate_text = result.answer_text
+    query.intent = result.intent
+    db.commit()
+    db.refresh(query)
 
     # **create object of Suppoert_Answer to create an answer linked with saved query
     answer = Support_Answer(query_id = query.id, answer_text= generate_text)
@@ -88,10 +136,11 @@ def create_query(request: SupportRequest,db = Depends(get_db)):
     "query_id": query.id,
     "question": query.question,
     "status": query.status,
-    "created_at": query.created_at
+    "created_at": query.created_at,
+    "intent": query.intent
 }
 
-@app.get("queries/{query_id}",response_model=QueryResponse)
+@app.get("/queries/{query_id}",response_model=QueryResponse)
 def get_query(query_id:UUID,db = Depends(get_db)):
     result = db.execute(select(SupportQuery).where(SupportQuery.id == query_id))
     query = result.scalar_one_or_none()
@@ -100,7 +149,8 @@ def get_query(query_id:UUID,db = Depends(get_db)):
     return {"query_id":query.id,
             "question":query.question,
             "status":query.status,
-            "created_at":query.created_at
+            "created_at":query.created_at,
+            "intent":query.intent
             }
 
 
@@ -116,7 +166,8 @@ def update_query(query_id:UUID, request:QueryUpdate, db = Depends(get_db)):
     return {"query_id":query.id,
             "question":query.question,
             "status":query.status,
-            "created_at":query.created_at
+            "created_at":query.created_at,
+            "intent":query.intent
             }
 
 

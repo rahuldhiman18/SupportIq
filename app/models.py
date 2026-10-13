@@ -13,6 +13,7 @@ class SupportQuery(Base):
     customer_email: Mapped[str] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(default = datetime.utcnow)
     status: Mapped[str] = mapped_column(default="pending")
+    intent: Mapped[str | None] = mapped_column(nullable=True)  # detected customer intent (eligibility/timing/how_to_request/refund_status/out_of_scope)
     knowledge_version_id:Mapped[UUID | None] = mapped_column(ForeignKey("knowledge_answer_versions.id"),nullable=True)
 
 

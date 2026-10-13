@@ -7,6 +7,10 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+#check condition (must run BEFORE create_engine, or we get a cryptic error instead)
+if not DATABASE_URL:
+    raise RuntimeError("Database Url is not set,Add it to your .env file")
+
 #for database engine
 engine = create_engine(DATABASE_URL)
 
@@ -16,7 +20,3 @@ SessionLocal = sessionmaker(bind=engine,autoflush=False)
 
 class Base(DeclarativeBase):
     pass
-
-#check condition 
-if not DATABASE_URL:
-    raise RuntimeError("Database Url is not set,Add it to your .env file")
