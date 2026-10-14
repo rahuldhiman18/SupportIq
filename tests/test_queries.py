@@ -17,7 +17,14 @@ from app.ai_service import (
     AIContentBlockedError,
     AIProviderError,
 )
-from app.models import KnowledgeAnswer, KnowledgeAnswerVersion, SupportQuery
+from app.models import (
+    KnowledgeAnswer,
+    KnowledgeAnswerVersion,
+    SupportQuery,
+    Order,
+    OrderEvent,
+    add_business_days,
+)
 
 POLICY_TEXT = "Refunds are available within 30 days of purchase."
 
@@ -263,3 +270,107 @@ def test_new_intents_pass_through(client, intent):
 
     assert response.status_code == 202
     assert response.json()["intent"] == intent
+
+
+# --- Phase 1: location algo (pure code - no AI involved) --------------------
+
+def test_add_business_days_skips_weekends():
+    friday = datetime(2026, 10, 9, 12, 0, tzinfo=timezone.utc)
+    assert add_business_days(friday, 1) == datetime(
+        2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+    assert add_business_days(friday, 5) == datetime(
+        2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+
+
+def _seed_order(db_session, number="ORD-777", email="a@b.com",
+                method="standard", events=None):
+    order = Order(order_number=number, customer_email=email,
+                  delivery_method=method, destination_city="Pune")
+    db_session.add(order)
+    db_session.flush()
+    for stage, location, occurred_at in (events or []):
+        db_session.add(OrderEvent(order_id=order.id, stage=stage,
+                                  location=location, occurred_at=occurred_at))
+    db_session.commit()
+    return order
+
+
+def test_eta_window_is_business_day_math(db_session):
+    order = _seed_order(db_session, events=[
+        ("placed", "Mumbai warehouse",
+         datetime(2026, 10, 10, 8, 0, tzinfo=timezone.utc)),
+        ("shipped", "Pune hub",
+         datetime(2026, 10, 12, 9, 0, tzinfo=timezone.utc)),
+    ])
+    earliest, latest = order.eta_window()
+    assert earliest.date().isoformat() == "2026-10-15"   # +3 business days
+    assert latest.date().isoformat() == "2026-10-19"     # +5 (weekend skipped)
+
+
+def test_stalled_order_detected_when_scans_go_stale(db_session):
+    stale = _seed_order(db_session, number="ORD-111", events=[
+        ("shipped", "Delhi hub",
+         datetime.now(timezone.utc) - timedelta(days=10)),
+    ])
+    assert stale.is_stalled() is True
+    fresh = _seed_order(db_session, number="ORD-222", events=[
+        ("shipped", "Delhi hub",
+         datetime.now(timezone.utc) - timedelta(hours=5)),
+    ])
+    assert fresh.is_stalled() is False
+
+
+# --- Phase 1: live facts reach the AI, but only for the right customer ------
+
+def _create_order_api(client, number="ORD-9001", email="a@b.com"):
+    return client.post("/orders", json={
+        "order_number": number, "customer_email": email,
+        "delivery_method": "standard", "destination_city": "Pune",
+        "carrier": "BlueDart",
+        "events": [
+            {"stage": "placed", "location": "Mumbai warehouse",
+             "occurred_at": "2026-10-10T10:00:00Z"},
+            {"stage": "shipped", "location": "Pune hub",
+             "occurred_at": "2026-10-12T09:00:00Z"},
+        ],
+    })
+
+
+def test_order_facts_are_injected_into_situation(client):
+    assert _create_order_api(client).status_code == 201
+    fake = CustomerAnswer(intent="order_tracking", answer_text="On the way!")
+    with patch("app.main.answer_customer_question", return_value=fake) as mock_ai:
+        response = client.post("/queries", json={
+            "customer_email": "a@b.com",
+            "question": "where is my order right now?",
+            "order_number": "ORD-9001",
+        })
+    assert response.status_code == 202
+    situation = mock_ai.call_args.kwargs["situation"]
+    assert "ORD-9001" in situation and "Pune hub" in situation
+    assert "ETA" in situation
+
+
+def test_order_number_is_extracted_from_question_text(client):
+    assert _create_order_api(client, number="ORD-9002").status_code == 201
+    fake = CustomerAnswer(intent="order_tracking", answer_text="Checking!")
+    with patch("app.main.answer_customer_question", return_value=fake) as mock_ai:
+        response = client.post("/queries", json={
+            "customer_email": "a@b.com",
+            "question": "can you check the status for ORD-9002 please?",
+        })
+    assert response.status_code == 202
+    assert "ORD-9002" in mock_ai.call_args.kwargs["situation"]
+
+
+def test_order_facts_never_leak_to_another_customer(client):
+    assert _create_order_api(client, number="ORD-9003").status_code == 201
+    fake = CustomerAnswer(intent="order_tracking", answer_text="ok")
+    with patch("app.main.answer_customer_question", return_value=fake) as mock_ai:
+        response = client.post("/queries", json={
+            "customer_email": "stranger@evil.com",
+            "question": "where is my order?",
+            "order_number": "ORD-9003",
+        })
+    assert response.status_code == 202
+    assert mock_ai.call_args.kwargs["situation"] is None  # no facts loaded

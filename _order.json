@@ -1,0 +1,24 @@
+{
+    "customer_email":  "live@example.com",
+    "events":  [
+                   {
+                       "occurred_at":  "2026-10-08T10:00:00Z",
+                       "location":  "Mumbai warehouse",
+                       "stage":  "placed"
+                   },
+                   {
+                       "occurred_at":  "2026-10-09T07:00:00Z",
+                       "location":  "Delhi hub",
+                       "stage":  "shipped"
+                   },
+                   {
+                       "occurred_at":  "2026-10-12T12:30:00Z",
+                       "location":  "Delhi doorstep",
+                       "stage":  "delivered"
+                   }
+               ],
+    "carrier":  "BlueDart",
+    "order_number":  "ORD-5003",
+    "delivery_method":  "express",
+    "destination_city":  "Delhi"
+}

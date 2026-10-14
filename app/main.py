@@ -1,6 +1,8 @@
+import re
 from datetime import datetime, date
 from uuid import UUID
 from enum import Enum
+from typing import Literal
 
 from fastapi import FastAPI,Depends,HTTPException
 from pydantic import BaseModel, Field
@@ -13,8 +15,9 @@ from app.ai_service import (
     AIContentBlockedError,
 )
 from .database import SessionLocal
-from .models import SupportQuery , Support_Answer , KnowledgeAnswer , KnowledgeAnswerVersion
+from .models import SupportQuery , Support_Answer , KnowledgeAnswer , KnowledgeAnswerVersion , Order , OrderEvent
 from sqlalchemy import select, desc
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 app = FastAPI(title = "SupportIq")
@@ -27,6 +30,8 @@ class SupportRequest(BaseModel):
     # Optional situation details -> lets the AI personalize (e.g. eligibility math)
     purchase_date: date | None = None
     order_status: str | None = Field(default=None, max_length=50)
+    # Optional: exact order number -> live tracking facts get injected
+    order_number: str | None = Field(default=None, max_length=32)
 
 class QueryResponse(BaseModel):
     query_id:UUID
@@ -66,6 +71,33 @@ class AnswerResponse(BaseModel):
     created_at: datetime
 
 
+# ** Phase 1: order tracking API (dummy orders feed the location algo)
+class OrderEventIn(BaseModel):
+    stage: Literal["placed", "packed", "shipped", "out_for_delivery", "delivered"]
+    location: str = Field(default="", max_length=200)
+    occurred_at: datetime
+
+
+class OrderCreate(BaseModel):
+    order_number: str = Field(min_length=3, max_length=32)
+    customer_email: str
+    delivery_method: Literal["standard", "express"] = "standard"
+    destination_city: str = Field(default="", max_length=100)
+    carrier: str | None = Field(default=None, max_length=100)
+    events: list[OrderEventIn] = []
+
+
+class OrderTrackResponse(BaseModel):
+    order_number: str
+    stage: str
+    current_location: str
+    eta_earliest: datetime | None = None
+    eta_latest: datetime | None = None
+    stalled: bool
+    delivery_method: str
+    destination_city: str
+
+
 
 
 def get_db():
@@ -75,6 +107,65 @@ def get_db():
        yield db
     finally:
        db.close()
+
+
+# ** Order-number extractor from free text: "status for ORD-9002" / "#A12345"
+_ORDER_NUMBER_RE = re.compile(r"\b#?([A-Za-z]{1,4}-?\d{4,8})\b")
+
+
+def _extract_order_number(question: str) -> str | None:
+    match = _ORDER_NUMBER_RE.search(question)
+    return match.group(1).upper() if match else None
+
+
+@app.post("/orders", status_code=201)
+def create_order(request: OrderCreate, db: Session = Depends(get_db)):
+    order = Order(
+        order_number=request.order_number.strip().upper(),
+        customer_email=request.customer_email,
+        delivery_method=request.delivery_method,
+        destination_city=request.destination_city,
+        carrier=request.carrier,
+    )
+    db.add(order)
+    db.flush()
+    for event in request.events:
+        db.add(OrderEvent(order_id=order.id, stage=event.stage,
+                          location=event.location,
+                          occurred_at=event.occurred_at))
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Order number already exists")
+    return {"order_number": order.order_number, "status": "created",
+            "events": len(request.events)}
+
+
+@app.get("/orders/{order_number}", response_model=OrderTrackResponse)
+def get_order(order_number: str, email: str, db: Session = Depends(get_db)):
+    # Scoped by email: wrong/missing email = 404, never leak other orders
+    order = db.execute(
+        select(Order).where(
+            Order.order_number == order_number.strip().upper(),
+            Order.customer_email == email,
+        )
+    ).scalars().first()
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+    earliest = latest = None
+    if order.current_stage != "delivered":
+        earliest, latest = order.eta_window()
+    return OrderTrackResponse(
+        order_number=order.order_number,
+        stage=order.current_stage,
+        current_location=order.current_location,
+        eta_earliest=earliest,
+        eta_latest=latest,
+        stalled=order.is_stalled(),
+        delivery_method=order.delivery_method,
+        destination_city=order.destination_city,
+    )
 
 # to create  unique query_id 
 @app.post("/queries", status_code = 202,response_model=QueryResponse)
@@ -114,6 +205,20 @@ def create_query(request: SupportRequest,db = Depends(get_db)):
     # !Generate an intent-aware Ai response, grounded in the knowledge base
     # Map typed AI errors to proper HTTP statuses (instead of raw 500s)
     situation_parts = []
+
+    # ** Phase 1: LIVE order facts (location algo) - real data beats guessing.
+    #    Scoped to the requester's email: other people's orders never load.
+    order_ref = request.order_number or _extract_order_number(request.question)
+    if order_ref:
+        order = db.execute(
+            select(Order).where(
+                Order.order_number == order_ref.strip().upper(),
+                Order.customer_email == request.customer_email,
+            )
+        ).scalars().first()
+        if order:
+            situation_parts.append(order.tracking_facts())
+
     if request.purchase_date:
         days_ago = (date.today() - request.purchase_date).days
         situation_parts.append(
