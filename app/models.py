@@ -86,6 +86,11 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _friendly_day(value: datetime) -> str:
+    """'Mon, Oct 19' -- reads naturally when the AI quotes it verbatim."""
+    return _as_utc(value).strftime("%a, %b %d").replace(" 0", " ")
+
+
 def add_business_days(start: datetime, days: int) -> datetime:
     """Add N business days (Mon-Fri only; holidays calendar = later)."""
     current = _as_utc(start)
@@ -170,18 +175,20 @@ class Order(Base):
         if last is None:
             return f"{head}; stage=placed; no carrier scans yet"
         if last.stage == "delivered":
-            delivered_on = _as_utc(last.occurred_at).date().isoformat()
+            delivered_on = _friendly_day(last.occurred_at)
             return f"{head}; stage=delivered on {delivered_on}"
         earliest, latest = self.eta_window()
         age_h = (datetime.now(timezone.utc) - _as_utc(last.occurred_at)
                  ).total_seconds() / 3600
+        last_scan = ("today" if age_h < 24 else
+                     f"{int(age_h // 24)} days ago")
         stalled = ("yes - open a carrier investigation"
                    if self.is_stalled() else "no")
         return (
-            f"{head}; stage={last.stage}; last scan at {last.location} on "
-            f"{_as_utc(last.occurred_at).isoformat(timespec='seconds')} "
-            f"({age_h:.0f}h ago); ETA between {earliest.date().isoformat()} "
-            f"and {latest.date().isoformat()}; stalled={stalled}"
+            f"{head}; stage={last.stage}; last scan at {last.location} "
+            f"({_friendly_day(last.occurred_at)}, {last_scan}); "
+            f"ETA between {_friendly_day(earliest)} "
+            f"and {_friendly_day(latest)}; stalled={stalled}"
         )
 
 
@@ -197,6 +204,21 @@ class OrderEvent(Base):
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     order: Mapped["Order"] = relationship(back_populates="events")
+
+
+class User(Base):
+    """Login account for JWT auth (Phase B). Password stored as PBKDF2 hash."""
+    __tablename__ = "users"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    username: Mapped[str] = mapped_column(String, unique=True, index=True)
+    email: Mapped[str] = mapped_column(String, unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String, nullable=False)
+    password_salt: Mapped[str] = mapped_column(String, nullable=False)
+    role: Mapped[str] = mapped_column(String, default="customer")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     
 
 

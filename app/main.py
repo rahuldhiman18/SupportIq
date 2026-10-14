@@ -1,10 +1,19 @@
+import base64
+import hashlib
+import hmac
+import json as _json
+import os
 import re
+import secrets
+import time
+from collections import defaultdict
 from datetime import datetime, date
 from uuid import UUID
 from enum import Enum
 from typing import Literal
 
-from fastapi import FastAPI,Depends,HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 
 from app.ai_service import (
@@ -15,12 +24,137 @@ from app.ai_service import (
     AIContentBlockedError,
 )
 from .database import SessionLocal
-from .models import SupportQuery , Support_Answer , KnowledgeAnswer , KnowledgeAnswerVersion , Order , OrderEvent
+from .models import SupportQuery , Support_Answer , KnowledgeAnswer , KnowledgeAnswerVersion , Order , OrderEvent , User
 from sqlalchemy import select, desc
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 app = FastAPI(title = "SupportIq")
+
+# ** Phase A auth: admin key guards the critical write endpoints,
+#    public chat stays open but IP-throttled (Gemini calls cost money)
+api_key_header = APIKeyHeader(name="X-Admin-Key", auto_error=False)
+
+# Dev fallback ONLY: tests/seed scripts run without a provisioned key.
+_TEST_ADMIN_KEY = "test-admin-key"
+
+
+def _expected_admin_key() -> str | None:
+    return os.getenv("ADMIN_API_KEY") or _TEST_ADMIN_KEY
+
+
+def require_admin_key(key: str | None = Depends(api_key_header)) -> None:
+    expected = _expected_admin_key()
+    if not key or not expected or not secrets.compare_digest(key, expected):
+        raise HTTPException(status_code=401,
+                            detail="Invalid or missing admin key")
+
+
+# ** JWT login (Phase B): stdlib-only HS256 + PBKDF2, no new dependencies.
+#    Tokens are OPTIONAL on existing routes (valid token scopes data to the
+#    logged-in email; missing token keeps the current email-param behavior).
+_JWT_ALGO = "HS256"
+_ACCESS_TOKEN_MINUTES = 15
+_TEST_JWT_SECRET = "test-jwt-secret-for-offline-tests"
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def _jwt_secret() -> str:
+    return os.getenv("JWT_SECRET_KEY") or _TEST_JWT_SECRET
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def issue_access_token(user: "User") -> str:
+    header = _b64url(_json.dumps({"alg": _JWT_ALGO, "typ": "JWT"}).encode())
+    payload = _b64url(_json.dumps({
+        "sub": user.username,
+        "email": user.email,
+        "role": user.role,
+        "exp": int(time.time()) + _ACCESS_TOKEN_MINUTES * 60,
+    }).encode())
+    sig = _b64url(hmac.new(_jwt_secret().encode(), f"{header}.{payload}".encode(),
+                           hashlib.sha256).digest())
+    return f"{header}.{payload}.{sig}"
+
+
+def verify_access_token(token: str) -> dict:
+    try:
+        header, payload, sig = token.split(".")
+        expected = _b64url(hmac.new(
+            _jwt_secret().encode(), f"{header}.{payload}".encode(),
+            hashlib.sha256).digest())
+        if not hmac.compare_digest(sig, expected):
+            raise HTTPException(status_code=401, detail="Invalid token")
+        claims = _json.loads(_b64url_decode(payload))
+    except (ValueError, HTTPException):
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    if claims.get("exp", 0) < int(time.time()):
+        raise HTTPException(status_code=401, detail="Token expired")
+    return claims
+
+
+def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
+    """PBKDF2-SHA256 (210k rounds) -> (salt_hex, hash_hex). No new dependency."""
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(),
+                                 bytes.fromhex(salt), 210_000)
+    return salt, digest.hex()
+
+
+def verify_password(password: str, salt: str, expected_hash: str) -> bool:
+    _, digest_hex = hash_password(password, salt)
+    return hmac.compare_digest(digest_hex, expected_hash)
+
+
+def current_identity(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> dict | None:
+    """Logged-in claims, or None for anonymous callers (routes stay open)."""
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        return None
+    return verify_access_token(credentials.credentials)
+
+
+class LoginRequest(BaseModel):
+    username_or_email: str = Field(min_length=1, max_length=320)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in_minutes: int = _ACCESS_TOKEN_MINUTES
+    username: str
+    email: str
+    role: str
+
+
+# Tiny in-memory sliding-window limiter: 30 POST /queries per IP per minute.
+# No new dependency (slowapi) for Phase A; swap for Redis in Phase C.
+_RATE_LIMIT = 30
+_RATE_WINDOW_SECONDS = 60.0
+_rate_hits: dict[str, list[float]] = defaultdict(list)
+
+
+def throttle_public_chat(request: Request) -> None:
+    now = time.monotonic()
+    ip = request.client.host if request.client else "unknown"
+    hits = [t for t in _rate_hits[ip] if now - t < _RATE_WINDOW_SECONDS]
+    _rate_hits[ip] = hits
+    if len(hits) >= _RATE_LIMIT:
+        raise HTTPException(status_code=429,
+                            detail="Too many requests - please wait a minute")
+    hits.append(now)
 
 #**structure what we get from customer**
 
@@ -119,7 +253,8 @@ def _extract_order_number(question: str) -> str | None:
 
 
 @app.post("/orders", status_code=201)
-def create_order(request: OrderCreate, db: Session = Depends(get_db)):
+def create_order(request: OrderCreate, db: Session = Depends(get_db),
+                 _admin: None = Depends(require_admin_key)):
     order = Order(
         order_number=request.order_number.strip().upper(),
         customer_email=request.customer_email,
@@ -128,12 +263,12 @@ def create_order(request: OrderCreate, db: Session = Depends(get_db)):
         carrier=request.carrier,
     )
     db.add(order)
-    db.flush()
-    for event in request.events:
-        db.add(OrderEvent(order_id=order.id, stage=event.stage,
-                          location=event.location,
-                          occurred_at=event.occurred_at))
     try:
+        db.flush()
+        for event in request.events:
+            db.add(OrderEvent(order_id=order.id, stage=event.stage,
+                              location=event.location,
+                              occurred_at=event.occurred_at))
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -142,13 +277,43 @@ def create_order(request: OrderCreate, db: Session = Depends(get_db)):
             "events": len(request.events)}
 
 
+@app.post("/auth/login", response_model=LoginResponse)
+def login(request: LoginRequest, http_request: Request,
+          db: Session = Depends(get_db),
+          _throttle: None = Depends(throttle_public_chat)):
+    # Same throttle as public chat: brute-force protection, stdlib only.
+    user = db.execute(
+        select(User).where(
+            (User.username == request.username_or_email)
+            | (User.email == request.username_or_email)
+        )
+    ).scalars().first()
+    if user is None or not user.is_active or not verify_password(
+            request.password, user.password_salt, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    return LoginResponse(
+        access_token=issue_access_token(user),
+        username=user.username,
+        email=user.email,
+        role=user.role,
+    )
+
+
 @app.get("/orders/{order_number}", response_model=OrderTrackResponse)
-def get_order(order_number: str, email: str, db: Session = Depends(get_db)):
+def get_order(order_number: str, email: str | None = None,
+              db: Session = Depends(get_db),
+              identity: dict | None = Depends(current_identity)):
+    # Token wins over ?email: a logged-in user can only see their own orders.
+    # Anonymous callers must pass ?email= (existing behavior, still open).
+    effective_email = (identity or {}).get("email") or email
+    if not effective_email:
+        raise HTTPException(status_code=401,
+                            detail="Login or pass ?email= to view this order")
     # Scoped by email: wrong/missing email = 404, never leak other orders
     order = db.execute(
         select(Order).where(
             Order.order_number == order_number.strip().upper(),
-            Order.customer_email == email,
+            Order.customer_email == effective_email,
         )
     ).scalars().first()
     if order is None:
@@ -169,7 +334,10 @@ def get_order(order_number: str, email: str, db: Session = Depends(get_db)):
 
 # to create  unique query_id 
 @app.post("/queries", status_code = 202,response_model=QueryResponse)
-def create_query(request: SupportRequest,db = Depends(get_db)):
+def create_query(request: SupportRequest, http_request: Request,
+                 db = Depends(get_db),
+                 _throttle: None = Depends(throttle_public_chat),
+                 identity: dict | None = Depends(current_identity)):
     query = SupportQuery(question= request.question,
                          customer_email=request.customer_email)
     db.add(query)
@@ -309,7 +477,8 @@ def get_latest_answer(query_id: UUID, db: Session = Depends(get_db)):
 
 
 @app.post("/knowledge",status_code=201)
-def create_knowledge(request: KnowledgeCreate,db: Session = Depends(get_db),):
+def create_knowledge(request: KnowledgeCreate,db: Session = Depends(get_db),
+                     _admin: None = Depends(require_admin_key),):
     knowledge = KnowledgeAnswer(canonical_question = request.canonical_question,
     source_url = request.source_url,
     is_active = False,)

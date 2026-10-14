@@ -322,6 +322,9 @@ def test_stalled_order_detected_when_scans_go_stale(db_session):
 
 # --- Phase 1: live facts reach the AI, but only for the right customer ------
 
+ADMIN_HEADERS = {"X-Admin-Key": "test-admin-key"}
+
+
 def _create_order_api(client, number="ORD-9001", email="a@b.com"):
     return client.post("/orders", json={
         "order_number": number, "customer_email": email,
@@ -333,7 +336,7 @@ def _create_order_api(client, number="ORD-9001", email="a@b.com"):
             {"stage": "shipped", "location": "Pune hub",
              "occurred_at": "2026-10-12T09:00:00Z"},
         ],
-    })
+    }, headers=ADMIN_HEADERS)
 
 
 def test_order_facts_are_injected_into_situation(client):
@@ -374,3 +377,125 @@ def test_order_facts_never_leak_to_another_customer(client):
         })
     assert response.status_code == 202
     assert mock_ai.call_args.kwargs["situation"] is None  # no facts loaded
+
+
+def test_duplicate_order_returns_409_not_500(client):
+    assert _create_order_api(client, number="ORD-9004").status_code == 201
+    response = _create_order_api(client, number="ORD-9004")
+    assert response.status_code == 409
+    assert "already exists" in response.json()["detail"]
+
+
+def test_live_facts_instruction_outranks_policy_boilerplate():
+    from app.ai_service import _INTENT_PROMPT
+    assert "those facts\nare the answer's core" in _INTENT_PROMPT
+    assert "quote the order number, stage, location, ETA" in _INTENT_PROMPT
+
+
+def test_tracking_facts_use_friendly_dates_not_iso(db_session):
+    order = _seed_order(db_session, number="ORD-FRIENDLY", events=[
+        ("placed", "Mumbai warehouse",
+         datetime(2026, 10, 10, 8, 0, tzinfo=timezone.utc)),
+        ("shipped", "Pune hub",
+         datetime(2026, 10, 12, 9, 0, tzinfo=timezone.utc)),
+    ])
+    facts = order.tracking_facts()
+    assert "2026-10-" not in facts          # no raw ISO dates leak out
+    assert "Mon, Oct 12" in facts           # last scan reads naturally
+    assert "Thu, Oct 15" in facts and "Mon, Oct 19" in facts  # ETA window
+    assert "T" not in facts.split("ETA")[0].split("scan")[-1]  # no ISO time
+
+
+# --- Phase A auth: admin key on critical writes, throttle on public chat ---
+
+def test_create_order_without_admin_key_is_401(client):
+    response = client.post("/orders", json={
+        "order_number": "ORD-NOKEY", "customer_email": "a@b.com"})
+    assert response.status_code == 401
+
+
+def test_create_order_with_wrong_admin_key_is_401(client):
+    response = client.post("/orders", json={
+        "order_number": "ORD-NOKEY", "customer_email": "a@b.com"},
+        headers={"X-Admin-Key": "wrong-key"})
+    assert response.status_code == 401
+
+
+def test_create_knowledge_without_admin_key_is_401(client):
+    response = client.post("/knowledge", json={
+        "canonical_question": "Q?", "answer_text": "A",
+        "source_url": "https://example.com/a"})
+    assert response.status_code == 401
+
+
+def test_create_knowledge_with_admin_key_is_201(client):
+    response = client.post("/knowledge", json={
+        "canonical_question": "Q?", "answer_text": "A",
+        "source_url": "https://example.com/a"}, headers=ADMIN_HEADERS)
+    assert response.status_code == 201
+
+
+def test_public_chat_is_throttled_after_30_per_minute(client):
+    from app.main import _rate_hits
+    _rate_hits.clear()
+    fake = CustomerAnswer(intent="out_of_scope", answer_text="ok")
+    with patch("app.main.answer_customer_question", return_value=fake):
+        for _ in range(30):
+            response = client.post("/queries", json={
+                "customer_email": "a@b.com", "question": "hi"})
+            assert response.status_code == 202
+        blocked = client.post("/queries", json={
+            "customer_email": "a@b.com", "question": "one too many"})
+    assert blocked.status_code == 429
+    _rate_hits.clear()
+
+
+# --- Phase B: JWT login (optional tokens; existing routes stay open) --------
+
+def test_login_rejects_wrong_password(client, db_session):
+    from app.main import hash_password
+    from app.models import User
+    salt, digest = hash_password("correct-horse")
+    db_session.add(User(username="u1", email="u1@example.com",
+                        password_hash=digest, password_salt=salt))
+    db_session.commit()
+    response = client.post("/auth/login", json={
+        "username_or_email": "u1", "password": "wrong-horse"})
+    assert response.status_code == 401
+
+
+def test_login_issues_usable_token_and_order_self_scopes(client, db_session):
+    from app.main import hash_password, _rate_hits
+    from app.models import User
+    _rate_hits.clear()
+    salt, digest = hash_password("s3cret!")
+    db_session.add(User(username="rahul", email="rahul@example.com",
+                        password_hash=digest, password_salt=salt, role="admin"))
+    db_session.commit()
+
+    login = client.post("/auth/login", json={
+        "username_or_email": "rahul@example.com", "password": "s3cret!"})
+    assert login.status_code == 200
+    token = login.json()["access_token"]
+    assert login.json()["username"] == "rahul"
+
+    # token-only order lookup (no ?email=): self-scopes to token email
+    assert _create_order_api(client, number="ORD-JWT",
+                             email="rahul@example.com").status_code == 201
+    mine = client.get("/orders/ORD-JWT",
+                      headers={"Authorization": f"Bearer {token}"})
+    assert mine.status_code == 200
+    assert mine.json()["order_number"] == "ORD-JWT"
+
+    # another customer's order stays 404 even with a valid token
+    assert _create_order_api(client, number="ORD-OTHER",
+                             email="other@example.com").status_code == 201
+    hidden = client.get("/orders/ORD-OTHER",
+                        headers={"Authorization": f"Bearer {token}"})
+    assert hidden.status_code == 404
+
+    # tampered token is rejected
+    bad = client.get("/orders/ORD-JWT",
+                     headers={"Authorization": f"Bearer {token[:-2]}xx"})
+    assert bad.status_code == 401
+    _rate_hits.clear()
