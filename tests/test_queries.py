@@ -60,8 +60,9 @@ def test_refund_question_passes_policy_context(client, db_session):
 
     assert response.status_code == 202
     assert mock_ai.call_count == 1
-    # policy_context kwarg must contain the seeded policy text
-    assert mock_ai.call_args.kwargs["policy_context"] == POLICY_TEXT
+    # policy_context must contain the seeded policy text (labeled with its topic)
+    assert POLICY_TEXT in mock_ai.call_args.kwargs["policy_context"]
+    assert "What is the refund policy?" in mock_ai.call_args.kwargs["policy_context"]
     assert mock_ai.call_args.args[0] == "can I get a refund?"
     # intent from the AI result is returned to the caller
     assert response.json()["intent"] == "eligibility"
@@ -103,6 +104,48 @@ def test_no_knowledge_passes_none_context(client):
     assert response.status_code == 202
     assert mock_ai.call_args.kwargs["policy_context"] is None
     assert mock_ai.call_args.kwargs["situation"] is None
+
+
+# --- multiple approved policies: ALL of them must reach the prompt ----------
+SHIPPING_TEXT = "Standard shipping takes 3-5 business days."
+
+
+def test_multiple_policies_all_reach_the_prompt(client, db_session):
+    _seed_current_policy(db_session)
+    shipping = KnowledgeAnswer(
+        canonical_question="What is the shipping policy?",
+        source_url="https://example.com/terms/shipping",
+        is_active=True,
+    )
+    db_session.add(shipping)
+    db_session.flush()
+    db_session.add(
+        KnowledgeAnswerVersion(
+            knowledge_answer_id=shipping.id,
+            version_number=1,
+            answer_text=SHIPPING_TEXT,
+            status="approved",
+            is_current=True,
+            approved_by="test",
+            approved_at=datetime.now(timezone.utc),
+        )
+    )
+    db_session.commit()
+
+    fake = CustomerAnswer(intent="timing", answer_text="ok")
+    with patch("app.main.answer_customer_question", return_value=fake) as mock_ai:
+        response = client.post(
+            "/queries",
+            json={"customer_email": "a@b.com", "question": "do you ship fast?"},
+        )
+
+    assert response.status_code == 202
+    context = mock_ai.call_args.kwargs["policy_context"]
+    # both current policies, each labeled with its topic, in ONE context
+    assert POLICY_TEXT in context
+    assert SHIPPING_TEXT in context
+    assert "What is the refund policy?" in context
+    assert "What is the shipping policy?" in context
 
 
 # --- personalization: customer situation reaches the AI prompt --------------
@@ -197,3 +240,26 @@ def test_get_latest_answer(client):
     response = client.get(f"/queries/{query_id}/answer")
     assert response.status_code == 200
     assert response.json()["answer_text"] == "You have 30 days."
+
+
+# --- new business intents are accepted end-to-end (not downgraded to unknown) ---
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        "order_tracking",
+        "delivery_eta",
+        "password_reset",
+        "account_management",
+        "payment_issues",
+        "wrong_purchase",
+        "wrong_address",
+    ],
+)
+def test_new_intents_pass_through(client, intent):
+    fake = CustomerAnswer(intent=intent, answer_text="Here is what to do.")
+    with patch("app.main.answer_customer_question", return_value=fake):
+        response = _post_question(client)
+
+    assert response.status_code == 202
+    assert response.json()["intent"] == intent

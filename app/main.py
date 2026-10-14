@@ -85,16 +85,31 @@ def create_query(request: SupportRequest,db = Depends(get_db)):
     db.commit()
     db.refresh(query)
 
-    # **Find the current approved knowledge version (source of truth), if any
-    knowledge_version = db.execute(
-        select(KnowledgeAnswerVersion)
+    # ** Find ALL current approved knowledge versions (source of truth), each
+    #    labeled with its topic so the AI grounds in the RIGHT policy.
+    #    (The old code used .first() which picked ONE arbitrary policy once
+    #    several existed -- answers could come from the wrong document.)
+    current_policies = db.execute(
+        select(KnowledgeAnswerVersion, KnowledgeAnswer.canonical_question)
+        .join(
+            KnowledgeAnswer,
+            KnowledgeAnswerVersion.knowledge_answer_id == KnowledgeAnswer.id,
+        )
         .where(KnowledgeAnswerVersion.is_current.is_(True))
-    ).scalars().first()
+        .order_by(KnowledgeAnswer.canonical_question)
+    ).all()
 
-    if knowledge_version:
-        query.knowledge_version_id = knowledge_version.id
+    if current_policies:
+        # schema allows one FK per query: store the first as the primary one
+        query.knowledge_version_id = current_policies[0][0].id
         db.commit()
         db.refresh(query)
+
+    # One combined, labeled policy block keeps the single AI call fast.
+    policy_context = "\n\n".join(
+        f"Topic - {canonical_question}:\n{version.answer_text}"
+        for version, canonical_question in current_policies
+    ) or None
 
     # !Generate an intent-aware Ai response, grounded in the knowledge base
     # Map typed AI errors to proper HTTP statuses (instead of raw 500s)
@@ -111,7 +126,7 @@ def create_query(request: SupportRequest,db = Depends(get_db)):
     try:
         result = answer_customer_question(
             query.question,
-            policy_context=knowledge_version.answer_text if knowledge_version else None,
+            policy_context=policy_context,
             situation=situation,
         )
     except AIRateLimitError:

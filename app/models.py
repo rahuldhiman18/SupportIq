@@ -11,9 +11,9 @@ class SupportQuery(Base):
     id: Mapped[UUID] = mapped_column(primary_key=True,default = uuid4)
     question: Mapped[str] = mapped_column()
     customer_email: Mapped[str] = mapped_column()
-    created_at: Mapped[datetime] = mapped_column(default = datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc))
     status: Mapped[str] = mapped_column(default="pending")
-    intent: Mapped[str | None] = mapped_column(nullable=True)  # detected customer intent (eligibility/timing/how_to_request/refund_status/out_of_scope)
+    intent: Mapped[str | None] = mapped_column(nullable=True)  # detected customer intent (eligibility/timing/how_to_request/refund_status/order_tracking/delivery_eta/password_reset/account_management/payment_issues/wrong_purchase/wrong_address/out_of_scope)
     knowledge_version_id:Mapped[UUID | None] = mapped_column(ForeignKey("knowledge_answer_versions.id"),nullable=True)
 
 
