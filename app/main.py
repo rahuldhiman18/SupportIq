@@ -5,6 +5,7 @@ import json as _json
 import os
 import re
 import secrets
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime, date
@@ -25,11 +26,44 @@ from app.ai_service import (
 )
 from .database import SessionLocal
 from .models import SupportQuery , Support_Answer , KnowledgeAnswer , KnowledgeAnswerVersion , Order , OrderEvent , User
+from .models import compute_base_priority
+# Prompt-context builder shared by the inline and queued paths (Step 3b).
+# _extract_order_number is re-exported: existing code/tests import it here.
+from .prompt_context import build_prompt_context, _extract_order_number  # noqa: F401
 from sqlalchemy import select, desc
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 app = FastAPI(title = "SupportIq")
+
+
+# ** Step 3b: QUERY_MODE flag -- "inline" (Phase A, default) keeps the AI
+#    call inside the HTTP request; "queued" enqueues only and a background
+#    worker drains by effective_score (FOR UPDATE SKIP LOCKED). Default
+#    stays inline until queued mode passes live smoke; flip via env.
+def _query_mode() -> str:
+    return os.getenv("QUERY_MODE", "inline").strip().lower()
+
+
+_worker_stop = threading.Event()
+
+
+@app.on_event("startup")
+def _start_queue_worker() -> None:
+    # In-process worker thread: no new deploy unit. Scaling later stays safe
+    # because the claim is exactly-once (proven live, 6 concurrent claimers).
+    if _query_mode() != "queued":
+        return  # inline mode: the request itself does the AI work
+    from . import worker as _worker
+    threading.Thread(
+        target=_worker.run_forever, kwargs={"stop_event": _worker_stop},
+        daemon=True, name="supportiq-queue-worker",
+    ).start()
+
+
+@app.on_event("shutdown")
+def _stop_queue_worker() -> None:
+    _worker_stop.set()
 
 # ** Phase A auth: admin key guards the critical write endpoints,
 #    public chat stays open but IP-throttled (Gemini calls cost money)
@@ -271,13 +305,8 @@ def get_db():
        db.close()
 
 
-# ** Order-number extractor from free text: "status for ORD-9002" / "#A12345"
-_ORDER_NUMBER_RE = re.compile(r"\b#?([A-Za-z]{1,4}-?\d{4,8})\b")
-
-
-def _extract_order_number(question: str) -> str | None:
-    match = _ORDER_NUMBER_RE.search(question)
-    return match.group(1).upper() if match else None
+# _extract_order_number now lives in prompt_context (Step 3b) and is
+# re-exported above so existing imports from app.main keep working.
 
 
 @app.post("/orders", status_code=201)
@@ -366,69 +395,60 @@ def create_query(request: SupportRequest, http_request: Request,
                  db = Depends(get_db),
                  _throttle: None = Depends(throttle_public_chat),
                  identity: dict | None = Depends(current_identity)):
+    # Persist the request extras (Step 3b): queued workers rebuild the prompt
+    # from these columns after the HTTP request is long gone. Inline mode
+    # reads them through the same context builder below, so both paths
+    # ground on identical inputs.
     query = SupportQuery(question= request.question,
-                         customer_email=request.customer_email)
+                         customer_email=request.customer_email,
+                         order_number=request.order_number,
+                         purchase_date=request.purchase_date,
+                         order_status=request.order_status)
     db.add(query)
     db.commit()
     db.refresh(query)
 
-    # ** Find ALL current approved knowledge versions (source of truth), each
-    #    labeled with its topic so the AI grounds in the RIGHT policy.
-    #    (The old code used .first() which picked ONE arbitrary policy once
-    #    several existed -- answers could come from the wrong document.)
-    current_policies = db.execute(
-        select(KnowledgeAnswerVersion, KnowledgeAnswer.canonical_question)
-        .join(
-            KnowledgeAnswer,
-            KnowledgeAnswerVersion.knowledge_answer_id == KnowledgeAnswer.id,
-        )
-        .where(KnowledgeAnswerVersion.is_current.is_(True))
-        .order_by(KnowledgeAnswer.canonical_question)
-    ).all()
+    ctx = build_prompt_context(
+        db,
+        question=query.question,
+        customer_email=query.customer_email,
+        order_number=query.order_number,
+        purchase_date=query.purchase_date,
+        order_status=query.order_status,
+    )
 
-    if current_policies:
+    if ctx.knowledge_version_id is not None:
         # schema allows one FK per query: store the first as the primary one
-        query.knowledge_version_id = current_policies[0][0].id
+        query.knowledge_version_id = ctx.knowledge_version_id
         db.commit()
         db.refresh(query)
 
-    # One combined, labeled policy block keeps the single AI call fast.
-    policy_context = "\n\n".join(
-        f"Topic - {canonical_question}:\n{version.answer_text}"
-        for version, canonical_question in current_policies
-    ) or None
+    if _query_mode() == "queued":
+        # ** Step 3b enqueue: NO AI call inside the request. Priority is
+        #    server-derived (never client-sent): stalled carriers, verified
+        #    from live order events, jump straight to CRITICAL; everything
+        #    else ages in from the base tier. The in-process worker claims by
+        #    effective_score with FOR UPDATE SKIP LOCKED and owns retries.
+        query.status = "queued"
+        query.priority = compute_base_priority(None, stalled=ctx.stalled)
+        db.commit()
+        db.refresh(query)
+        return {
+            "query_id": query.id,
+            "question": query.question,
+            "status": query.status,
+            "created_at": query.created_at,
+            "intent": query.intent,
+        }
 
+    # ---- inline (Phase A behavior, unchanged; QUERY_MODE=inline default) ----
     # !Generate an intent-aware Ai response, grounded in the knowledge base
     # Map typed AI errors to proper HTTP statuses (instead of raw 500s)
-    situation_parts = []
-
-    # ** Phase 1: LIVE order facts (location algo) - real data beats guessing.
-    #    Scoped to the requester's email: other people's orders never load.
-    order_ref = request.order_number or _extract_order_number(request.question)
-    if order_ref:
-        order = db.execute(
-            select(Order).where(
-                Order.order_number == order_ref.strip().upper(),
-                Order.customer_email == request.customer_email,
-            )
-        ).scalars().first()
-        if order:
-            situation_parts.append(order.tracking_facts())
-
-    if request.purchase_date:
-        days_ago = (date.today() - request.purchase_date).days
-        situation_parts.append(
-            f"purchased {days_ago} days ago (on {request.purchase_date.isoformat()})"
-        )
-    if request.order_status:
-        situation_parts.append(f"order status: {request.order_status}")
-    situation = "; ".join(situation_parts) or None
-
     try:
         result = answer_customer_question(
             query.question,
-            policy_context=policy_context,
-            situation=situation,
+            policy_context=ctx.policy_context,
+            situation=ctx.situation,
         )
     except AIRateLimitError:
         raise HTTPException(status_code=429, detail="AI is busy, please try again shortly")

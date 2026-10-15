@@ -2,7 +2,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String ,CheckConstraint,Index,UniqueConstraint
 from sqlalchemy.orm import Mapped , mapped_column, relationship
 from .database import Base
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 import threading
 
 
@@ -97,6 +97,12 @@ class SupportQuery(Base):
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True),
                                                            nullable=True)
     last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Step 3b request context: queued mode persists the SupportRequest extras
+    # so the worker rebuilds the identical prompt (order facts, purchase-date
+    # math, order-status hint) after the HTTP request is long gone.
+    order_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    purchase_date: Mapped[date | None] = mapped_column(nullable=True)
+    order_status: Mapped[str | None] = mapped_column(String, nullable=True)
     __table_args__ = (
         Index("ix_support_queries_queue_claim", "status", "next_retry_at"),
     )
