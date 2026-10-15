@@ -40,12 +40,23 @@ _TEST_ADMIN_KEY = "test-admin-key"
 
 
 def _expected_admin_key() -> str | None:
-    return os.getenv("ADMIN_API_KEY") or _TEST_ADMIN_KEY
+    configured = os.getenv("ADMIN_API_KEY")
+    if configured:
+        return configured
+    # Offline-test fallback ONLY: pytest sets PYTEST_CURRENT_TEST while a test
+    # body runs. Outside tests an unset ADMIN_API_KEY now fails CLOSED
+    # (require_admin_key 401s) instead of exposing the well-known test key.
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return _TEST_ADMIN_KEY
+    return None
 
 
 def require_admin_key(key: str | None = Depends(api_key_header)) -> None:
     expected = _expected_admin_key()
-    if not key or not expected or not secrets.compare_digest(key, expected):
+    # secrets.compare_digest raises TypeError on non-ASCII str -> compare bytes.
+    if (not key or not expected
+            or not secrets.compare_digest(key.encode("utf-8"),
+                                          expected.encode("utf-8"))):
         raise HTTPException(status_code=401,
                             detail="Invalid or missing admin key")
 
@@ -61,7 +72,15 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def _jwt_secret() -> str:
-    return os.getenv("JWT_SECRET_KEY") or _TEST_JWT_SECRET
+    secret = os.getenv("JWT_SECRET_KEY")
+    if secret:
+        return secret
+    # Offline-test fallback ONLY: same fail-closed rule as the admin key --
+    # a predictable secret in prod would let anyone forge admin tokens.
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return _TEST_JWT_SECRET
+    raise HTTPException(status_code=503,
+                        detail="JWT_SECRET_KEY is not configured")
 
 
 def _b64url(data: bytes) -> str:
@@ -159,7 +178,10 @@ def throttle_public_chat(request: Request) -> None:
 #**structure what we get from customer**
 
 class SupportRequest(BaseModel):
-    customer_email : str
+    # Shape check at the edge: garbage emails used to be stored and then used
+    # for identity scoping / ownership checks. RFC-5322-lite, stdlib re only.
+    customer_email : str = Field(pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+                                 max_length=254)
     question : str = Field(min_length = 1 , max_length = 500)
     # Optional situation details -> lets the AI personalize (e.g. eligibility math)
     purchase_date: date | None = None
@@ -182,6 +204,12 @@ class QueryStatus(str,Enum):
 
 class QueryUpdate(BaseModel):
     status: QueryStatus
+
+
+class HumanAnswerRequest(BaseModel):
+    # Admin/human pickup: agent writes the authoritative reply for a query the
+    # AI could not answer within its retry budget (see app/worker.py).
+    answer_text: str = Field(min_length=1, max_length=5000)
 
 
 class KnowledgeCreate(BaseModel):
@@ -331,7 +359,7 @@ def get_order(order_number: str, email: str | None = None,
         delivery_method=order.delivery_method,
         destination_city=order.destination_city,
     )
-
+ 
 # to create  unique query_id 
 @app.post("/queries", status_code = 202,response_model=QueryResponse)
 def create_query(request: SupportRequest, http_request: Request,
@@ -429,8 +457,16 @@ def create_query(request: SupportRequest, http_request: Request,
 }
 
 @app.get("/queries/{query_id}",response_model=QueryResponse)
-def get_query(query_id:UUID,db = Depends(get_db)):
-    result = db.execute(select(SupportQuery).where(SupportQuery.id == query_id))
+def get_query(query_id:UUID, email: str | None = None, db = Depends(get_db),
+              identity: dict | None = Depends(current_identity)):
+    # READ-ONLY: select only, no writes, no AI calls -- safe to poll/refresh/cached.
+    # Ownership: token email wins; else ?email= must match; else legacy open
+    # (keeps existing offline tests passing; Phase C will require auth).
+    effective_email = (identity or {}).get("email") or email
+    stmt = select(SupportQuery).where(SupportQuery.id == query_id)
+    if effective_email:
+        stmt = stmt.where(SupportQuery.customer_email == effective_email)
+    result = db.execute(stmt)
     query = result.scalar_one_or_none()
     if query is None:
         raise HTTPException(status_code=404,detail="Query not found")
@@ -443,7 +479,10 @@ def get_query(query_id:UUID,db = Depends(get_db)):
 
 
 @app.patch("/queries/{query_id}",response_model=QueryResponse,status_code=200)
-def update_query(query_id:UUID, request:QueryUpdate, db = Depends(get_db)):
+def update_query(query_id:UUID, request:QueryUpdate, db = Depends(get_db),
+                 _admin: None = Depends(require_admin_key)):
+    # Status transitions are staff-only. Before this check anyone holding a
+    # query UUID could flip any status (needs_human -> resolved, etc.).
     result = db.execute(select(SupportQuery).where(SupportQuery.id==query_id))
     query = result.scalar_one_or_none()
     if query is None:
@@ -460,7 +499,18 @@ def update_query(query_id:UUID, request:QueryUpdate, db = Depends(get_db)):
 
 
 @app.get("/queries/{query_id}/answer", response_model=AnswerResponse)
-def get_latest_answer(query_id: UUID, db: Session = Depends(get_db)):
+def get_latest_answer(query_id: UUID, email: str | None = None,
+                      db: Session = Depends(get_db),
+                      identity: dict | None = Depends(current_identity)):
+    # READ-ONLY: select only, no writes, no AI calls -- safe to poll/refresh/cached.
+    # Ownership scoped like get_query: token wins, else ?email=, else legacy open.
+    effective_email = (identity or {}).get("email") or email
+    owner_stmt = select(SupportQuery.id).where(SupportQuery.id == query_id)
+    if effective_email:
+        owner_stmt = owner_stmt.where(SupportQuery.customer_email == effective_email)
+    owner = db.execute(owner_stmt).scalar_one_or_none()
+    if owner is None:
+        raise HTTPException(status_code=404, detail="Query not found")
     # Find answers for this query, newest first
     stmt = (
         select(Support_Answer)
@@ -474,6 +524,66 @@ def get_latest_answer(query_id: UUID, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="No answer found for this query yet.")
 
     return answer
+
+
+@app.patch("/queries/{query_id}/answer", response_model=AnswerResponse)
+def human_answer_query(query_id: UUID, request: HumanAnswerRequest,
+                       db: Session = Depends(get_db),
+                       _admin: None = Depends(require_admin_key)):
+    # Human-in-the-loop pickup: after Option A exhausts its 3 AI attempts the
+    # query sits in needs_human; an agent (admin key) posts the authoritative
+    # reply here. Answer + status flip happen in ONE transaction.
+    result = db.execute(select(SupportQuery).where(SupportQuery.id == query_id))
+    query = result.scalar_one_or_none()
+    if query is None:
+        raise HTTPException(status_code=404, detail="Query not found")
+    if query.status == "closed":
+        raise HTTPException(status_code=409, detail="Query is closed")
+
+    try:
+        answer = Support_Answer(
+            query_id=query.id,
+            answer_text=request.answer_text,
+            is_selected=True,  # human reply is the authoritative answer
+        )
+        db.add(answer)
+        query.status = "resolved"
+        db.commit()
+        db.refresh(answer)
+    except Exception:
+        db.rollback()
+        raise
+    return answer
+
+
+@app.get("/admin/needs-human")
+def list_needs_human(db: Session = Depends(get_db),
+                     _admin: None = Depends(require_admin_key)):
+    # Notification channel for the human loop: a dashboard polls this every
+    # 5-10s and pops up "AI failed -- you need to answer" per item. Items leave
+    # the feed the moment an agent answers them (status leaves needs_human), so
+    # no separate read/dismiss state is needed.
+    rows = db.execute(
+        select(SupportQuery)
+        .where(SupportQuery.status == "needs_human")
+        .order_by(SupportQuery.created_at.asc())
+    ).scalars().all()
+    items = [
+        {
+            "query_id": q.id,
+            "question": q.question,
+            "customer_email": q.customer_email,
+            "attempts": q.attempts,
+            "last_error": q.last_error,
+            "message": (
+                f"AI failed after {q.attempts} attempt(s) -- you need to answer "
+                "this query."
+            ),
+            "created_at": q.created_at,
+        }
+        for q in rows
+    ]
+    return {"count": len(items), "items": items}
 
 
 @app.post("/knowledge",status_code=201)

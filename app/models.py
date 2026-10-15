@@ -1,8 +1,78 @@
 from uuid import UUID, uuid4
-from sqlalchemy import Boolean, DateTime, ForeignKey, String ,CheckConstraint,Index,UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String ,CheckConstraint,Index,UniqueConstraint
 from sqlalchemy.orm import Mapped , mapped_column, relationship
 from .database import Base
 from datetime import datetime, timezone, timedelta
+import threading
+
+
+# --- Step 2.5: strictly-increasing clock (bug-hunt fix) ----------------------
+# Windows serves datetime.now() in ~15.6ms timer ticks, so back-to-back
+# inserts (e.g. two PATCH /queries/{id}/answer calls) can land on the SAME
+# microsecond. With ORDER BY created_at DESC that is a tie, and the "older"
+# answer could surface as latest. A process-wide high-water mark keeps
+# timestamps unique by nudging stalled reads forward 1us (error stays well
+# under a millisecond). Multi-process deployments can still theoretically
+# collide across processes; that window is sub-microsecond and worth a DB
+# sequence only if it ever shows up in practice.
+_ts_lock = threading.Lock()
+_ts_high_water: datetime | None = None
+
+
+def utcnow_unique() -> datetime:
+    """now(UTC) that never returns the same value twice in this process."""
+    global _ts_high_water
+    now = datetime.now(timezone.utc)
+    with _ts_lock:
+        if _ts_high_water is not None and now <= _ts_high_water:
+            now = _ts_high_water + timedelta(microseconds=1)
+        _ts_high_water = now
+    return now
+
+
+# --- Step 2: priority-with-aging queue (DB-persisted, crash-safe) --------------
+# Wide bands you approved: 0/100/200/300/400, 1 point per 30s.
+# Lower score = served first. Waiting reduces score so old normals
+# eventually outrank new urgents (no starvation).
+AGING_SECONDS_PER_POINT = 30.0
+
+PRIORITY_CRITICAL = 0      # payment_issues or stalled order (verified server-side)
+PRIORITY_HIGH = 100        # order_tracking / delivery_eta / wrong_address / wrong_purchase
+PRIORITY_NORMAL = 200      # eligibility / timing / refund_status
+PRIORITY_LOW = 300         # how_to_request / password_reset / account_management
+PRIORITY_LOWEST = 400      # out_of_scope / unknown / default
+
+
+def compute_base_priority(intent: str | None,
+                          stalled: bool = False) -> int:
+    """Server-derived base weight. Never trust a client-sent urgency flag.
+
+    Stalled carrier (3+ biz days, computed from Order.is_stalled) and
+    payment_issues jump to 0. Everything else maps from intent.
+    """
+    if stalled or intent == "payment_issues":
+        return PRIORITY_CRITICAL
+    if intent in ("order_tracking", "delivery_eta",
+                  "wrong_address", "wrong_purchase"):
+        return PRIORITY_HIGH
+    if intent in ("eligibility", "timing", "refund_status"):
+        return PRIORITY_NORMAL
+    if intent in ("how_to_request", "password_reset", "account_management"):
+        return PRIORITY_LOW
+    return PRIORITY_LOWEST
+
+
+def effective_score(base_priority: int, created_at: datetime,
+                    now: datetime | None = None) -> float:
+    """Lower = serve first. wait_seconds / 30 aged off the base weight."""
+    created = created_at
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    at = now or datetime.now(timezone.utc)
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    waited = max(0.0, (at - created).total_seconds())
+    return base_priority - waited / AGING_SECONDS_PER_POINT
 
 
 class SupportQuery(Base):
@@ -11,10 +81,25 @@ class SupportQuery(Base):
     id: Mapped[UUID] = mapped_column(primary_key=True,default = uuid4)
     question: Mapped[str] = mapped_column()
     customer_email: Mapped[str] = mapped_column()
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc))
+    # utcnow_unique: equal created_at values would tie effective_score and
+    # make queue claim order non-deterministic.
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),default=utcnow_unique)
     status: Mapped[str] = mapped_column(default="pending")
     intent: Mapped[str | None] = mapped_column(nullable=True)  # detected customer intent (eligibility/timing/how_to_request/refund_status/order_tracking/delivery_eta/password_reset/account_management/payment_issues/wrong_purchase/wrong_address/out_of_scope)
     knowledge_version_id:Mapped[UUID | None] = mapped_column(ForeignKey("knowledge_answer_versions.id"),nullable=True)
+    # Queue durability: survives restarts; workers claim via FOR UPDATE SKIP LOCKED.
+    priority: Mapped[int] = mapped_column(Integer, default=PRIORITY_LOWEST,
+                                          server_default="400", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0,
+                                          server_default="0", nullable=False)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True),
+                                                       nullable=True)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True),
+                                                           nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    __table_args__ = (
+        Index("ix_support_queries_queue_claim", "status", "next_retry_at"),
+    )
 
 
 class Support_Answer(Base):
@@ -24,7 +109,11 @@ class Support_Answer(Base):
     query_id: Mapped[UUID] = mapped_column(ForeignKey("support_queries.id"),nullable=False)
     answer_text:Mapped[str] = mapped_column()
     is_selected: Mapped[bool] = mapped_column(default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone =True),default=lambda:datetime.now(timezone.utc))
+    # utcnow_unique: GET /queries/{id}/answer orders by created_at DESC; the
+    # tick-quantized wall clock handed two rapid answers the SAME timestamp
+    # and the older answer could win the tie. Unique timestamps fix that
+    # without a schema change.
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone =True),default=utcnow_unique)
 
 
 class KnowledgeAnswer(Base):

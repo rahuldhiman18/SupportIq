@@ -37,6 +37,11 @@ def _create_test_tables():
     Base.metadata.create_all(_test_engine)
     yield
     Base.metadata.drop_all(_test_engine)
+    # The public-chat throttle keeps a GLOBAL in-memory hit list per IP, and
+    # TestClient always uses the same IP ("testclient") -- clear it so throttle
+    # budget from one test never 429s an unrelated later test.
+    import app.main as _main
+    _main._rate_hits.clear()
 
 
 @pytest.fixture

@@ -238,6 +238,254 @@ def test_get_query_404(client):
     assert response.status_code == 404
 
 
+def test_get_endpoints_are_read_only_no_side_effects(client, db_session):
+    # Repeated GET polling must not create answers, mutate the query, or call AI.
+    from app.models import Support_Answer
+    fake = CustomerAnswer(intent="eligibility", answer_text="ok")
+    with patch("app.main.answer_customer_question", return_value=fake) as mock_ai:
+        created = _post_question(client)
+    query_id = created.json()["query_id"]
+    before_count = db_session.query(Support_Answer).count()
+    mock_ai.reset_mock()
+
+    for _ in range(5):
+        assert client.get(f"/queries/{query_id}").status_code == 200
+        assert client.get(f"/queries/{query_id}/answer").status_code == 200
+
+    db_session.expire_all()
+    assert mock_ai.call_count == 0  # no AI triggered by GET polling
+    assert db_session.query(Support_Answer).count() == before_count
+
+
+def test_get_query_scoped_to_owner_email_returns_404_for_stranger(client):
+    # ?email= scoping: stranger must not read another customer's query (404, not leak).
+    fake = CustomerAnswer(intent="eligibility", answer_text="ok")
+    with patch("app.main.answer_customer_question", return_value=fake):
+        created = _post_question(client)  # owned by a@b.com
+    query_id = created.json()["query_id"]
+
+    assert client.get(f"/queries/{query_id}?email=a@b.com").status_code == 200
+    assert client.get(f"/queries/{query_id}?email=stranger@evil.com").status_code == 404
+    assert client.get(
+        f"/queries/{query_id}/answer?email=stranger@evil.com").status_code == 404
+
+
+# --- Step 2: priority-with-aging math (pure code, no DB writes) --------------
+
+def test_base_priority_ignores_client_urgency_spoof():
+    # Server maps from intent + verified stall only; no client urgency param exists.
+    from app.models import (compute_base_priority, PRIORITY_CRITICAL,
+                            PRIORITY_HIGH, PRIORITY_NORMAL, PRIORITY_LOW,
+                            PRIORITY_LOWEST)
+    assert compute_base_priority("payment_issues") == PRIORITY_CRITICAL
+    assert compute_base_priority("eligibility", stalled=True) == PRIORITY_CRITICAL
+    assert compute_base_priority("order_tracking") == PRIORITY_HIGH
+    assert compute_base_priority("delivery_eta") == PRIORITY_HIGH
+    assert compute_base_priority("eligibility") == PRIORITY_NORMAL
+    assert compute_base_priority("timing") == PRIORITY_NORMAL
+    assert compute_base_priority("how_to_request") == PRIORITY_LOW
+    assert compute_base_priority("out_of_scope") == PRIORITY_LOWEST
+    assert compute_base_priority(None) == PRIORITY_LOWEST
+    assert compute_base_priority("unknown") == PRIORITY_LOWEST
+
+
+def test_aging_eventually_beats_fresh_urgent_no_starvation():
+    # Wide bands: critical=0, normal=200, 1pt per 30s.
+    # Old normal after 50min wait: 200-100=100... after 110min: 200-220=-20 < 0.
+    from datetime import timedelta
+    from app.models import (effective_score, PRIORITY_CRITICAL, PRIORITY_NORMAL)
+    now = datetime.now(timezone.utc)
+    fresh_urgent = effective_score(PRIORITY_CRITICAL, now, now)
+    old_normal_50min = effective_score(
+        PRIORITY_NORMAL, now - timedelta(minutes=50), now)
+    old_normal_110min = effective_score(
+        PRIORITY_NORMAL, now - timedelta(minutes=110), now)
+    # 50min is not enough to overtake (100 > 0): priority still respected early.
+    assert old_normal_50min > fresh_urgent
+    # 110min overtakes (-20 < 0): starvation-proof over long waits.
+    assert old_normal_110min < fresh_urgent
+
+
+def test_aging_ordering_is_monotonic_in_wait():
+    # Same band: older always scores lower (served first). Newer never jumps older.
+    from datetime import timedelta
+    from app.models import effective_score, PRIORITY_HIGH
+    now = datetime.now(timezone.utc)
+    older = effective_score(PRIORITY_HIGH, now - timedelta(minutes=10), now)
+    newer = effective_score(PRIORITY_HIGH, now - timedelta(minutes=1), now)
+    assert older < newer
+
+
+# --- Human-in-the-loop: admin answers after the AI gives up (Option A) ------
+
+
+def _make_needs_human(db_session, email="a@b.com"):
+    q = SupportQuery(
+        question="where is my refund?",
+        customer_email=email,
+        status="needs_human",
+    )
+    db_session.add(q)
+    db_session.commit()
+    db_session.refresh(q)
+    return q
+
+
+def test_human_answer_requires_admin_key(client, db_session):
+    q = _make_needs_human(db_session)
+    r = client.patch(f"/queries/{q.id}/answer", json={"answer_text": "Hi"})
+    assert r.status_code == 401
+    r = client.patch(
+        f"/queries/{q.id}/answer",
+        json={"answer_text": "Hi"},
+        headers={"X-Admin-Key": "wrong-key"},
+    )
+    assert r.status_code == 401
+
+
+def test_human_answer_404_unknown_query(client):
+    r = client.patch(
+        "/queries/00000000-0000-0000-0000-000000000000/answer",
+        json={"answer_text": "Hi"},
+        headers=ADMIN_HEADERS,
+    )
+    assert r.status_code == 404
+
+
+def test_human_answer_resolves_query(client, db_session):
+    from app.models import Support_Answer
+
+    q = _make_needs_human(db_session)
+    r = client.patch(
+        f"/queries/{q.id}/answer",
+        json={"answer_text": "Your refund is on the way."},
+        headers=ADMIN_HEADERS,
+    )
+    assert r.status_code == 200
+    assert r.json()["answer_text"] == "Your refund is on the way."
+    # Single transaction: answer persisted AND query flipped out of needs_human.
+    db_session.expire_all()
+    assert db_session.query(Support_Answer).filter_by(query_id=q.id).count() == 1
+    row = db_session.query(SupportQuery).filter_by(id=q.id).one()
+    assert row.status == "resolved"
+
+
+def test_human_answer_rejects_empty_text(client, db_session):
+    q = _make_needs_human(db_session)
+    r = client.patch(
+        f"/queries/{q.id}/answer",
+        json={"answer_text": ""},
+        headers=ADMIN_HEADERS,
+    )
+    assert r.status_code == 422
+
+
+def test_human_answer_rejects_closed_query(client, db_session):
+    q = _make_needs_human(db_session)
+    q.status = "closed"
+    db_session.commit()
+    r = client.patch(
+        f"/queries/{q.id}/answer",
+        json={"answer_text": "Hi"},
+        headers=ADMIN_HEADERS,
+    )
+    assert r.status_code == 409
+
+
+# --- Status-change auth + the "AI failed" notification feed ------------------
+
+
+def test_status_change_requires_admin_key(client, db_session):
+    q = _make_needs_human(db_session)
+    q.status = "pending"
+    db_session.commit()
+    r = client.patch(f"/queries/{q.id}", json={"status": "resolved"})
+    assert r.status_code == 401
+    r = client.patch(
+        f"/queries/{q.id}",
+        json={"status": "resolved"},
+        headers={"X-Admin-Key": "wrong-key"},
+    )
+    assert r.status_code == 401
+
+
+def test_admin_can_change_status(client, db_session):
+    q = _make_needs_human(db_session)
+    q.status = "pending"
+    db_session.commit()
+    r = client.patch(
+        f"/queries/{q.id}",
+        json={"status": "closed"},
+        headers=ADMIN_HEADERS,
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "closed"
+    db_session.expire_all()
+    assert db_session.query(SupportQuery).filter_by(id=q.id).one().status == "closed"
+
+
+def test_status_change_404_and_422(client, db_session):
+    q = _make_needs_human(db_session)
+    r = client.patch(
+        "/queries/00000000-0000-0000-0000-000000000000",
+        json={"status": "closed"},
+        headers=ADMIN_HEADERS,
+    )
+    assert r.status_code == 404
+    r = client.patch(
+        f"/queries/{q.id}",
+        json={"status": "not-a-status"},
+        headers=ADMIN_HEADERS,
+    )
+    assert r.status_code == 422
+
+
+def test_needs_human_feed_requires_admin_key(client):
+    assert client.get("/admin/needs-human").status_code == 401
+    r = client.get("/admin/needs-human", headers={"X-Admin-Key": "wrong"})
+    assert r.status_code == 401
+
+
+def test_needs_human_feed_lists_only_failed_queries(client, db_session):
+    # Empty DB -> count 0 (conftest drops tables between tests).
+    r = client.get("/admin/needs-human", headers=ADMIN_HEADERS)
+    assert r.status_code == 200
+    assert r.json() == {"count": 0, "items": []}
+
+    answered = _make_needs_human(db_session, email="done@b.com")
+    answered.status = "resolved"
+    db_session.add(
+        SupportQuery(question="still pending", customer_email="c@d.com", status="pending")
+    )
+    failed = _make_needs_human(db_session, email="stuck@b.com")
+    failed.attempts = 3
+    failed.last_error = "AIProviderError: 500"
+    db_session.commit()
+
+    r = client.get("/admin/needs-human", headers=ADMIN_HEADERS)
+    body = r.json()
+    assert body["count"] == 1
+    item = body["items"][0]
+    assert item["query_id"] == str(failed.id)
+    assert item["question"] == "where is my refund?"
+    assert item["attempts"] == 3
+    assert "AIProviderError" in item["last_error"]
+    # The popup text the dashboard renders:
+    assert "you need to answer" in item["message"]
+    assert "AI failed" in item["message"]
+
+
+def test_needs_human_feed_orders_oldest_first(client, db_session):
+    older = _make_needs_human(db_session, email="older@b.com")
+    newer = _make_needs_human(db_session, email="newer@b.com")
+    older.created_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+    db_session.commit()
+
+    r = client.get("/admin/needs-human", headers=ADMIN_HEADERS)
+    ids = [i["query_id"] for i in r.json()["items"]]
+    assert ids == [str(older.id), str(newer.id)]
+
+
 def test_get_latest_answer(client):
     fake = CustomerAnswer(intent="timing", answer_text="You have 30 days.")
     with patch("app.main.answer_customer_question", return_value=fake):
@@ -499,3 +747,76 @@ def test_login_issues_usable_token_and_order_self_scopes(client, db_session):
                      headers={"Authorization": f"Bearer {token[:-2]}xx"})
     assert bad.status_code == 401
     _rate_hits.clear()
+
+
+# --- Bug-hunt regressions (fixes applied in this pass) -----------------------
+
+def test_double_human_answer_two_rows_newest_wins(client, db_session):
+    # Regression: two rapid PATCH /answer calls used to land in the same
+    # Windows timer tick and share one created_at; the ORDER BY created_at DESC
+    # tie made GET /answer surface the OLDER row. models.utcnow_unique() now
+    # guarantees strictly increasing timestamps within the process.
+    from app.models import Support_Answer
+
+    q = SupportQuery(question="q?", customer_email="probe@b.com",
+                     status="needs_human")
+    db_session.add(q)
+    db_session.commit()
+    db_session.refresh(q)
+
+    r1 = client.patch(f"/queries/{q.id}/answer", json={"answer_text": "first"},
+                      headers=ADMIN_HEADERS)
+    r2 = client.patch(f"/queries/{q.id}/answer", json={"answer_text": "second"},
+                      headers=ADMIN_HEADERS)
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.json()["created_at"] != r2.json()["created_at"]
+
+    db_session.expire_all()
+    assert db_session.query(Support_Answer).filter_by(query_id=q.id).count() == 2
+    got = client.get(f"/queries/{q.id}/answer?email=probe@b.com").json()
+    assert got["answer_text"] == "second"
+
+
+def test_utcnow_unique_is_strictly_increasing_under_burst():
+    from app.models import utcnow_unique
+
+    stamps = [utcnow_unique() for _ in range(500)]
+    assert all(b > a for a, b in zip(stamps, stamps[1:]))
+
+
+def test_non_ascii_admin_key_is_401_not_500():
+    # secrets.compare_digest raises TypeError on non-ASCII str; the fix
+    # compares UTF-8 bytes so garbage input can never 500 the endpoint.
+    # (httpx refuses to ascii-encode such headers client-side, so call the
+    # auth dependency directly -- this is exactly what a raw socket client
+    # delivering b"caf\\xe9" would hit after latin-1 header decoding.)
+    from fastapi import HTTPException
+    from app.main import require_admin_key
+
+    with pytest.raises(HTTPException) as exc:
+        require_admin_key(key="café")
+    assert exc.value.status_code == 401
+
+
+def test_email_shape_validation(client):
+    # Garbage emails used to be accepted and stored; shape is now validated
+    # at the edge (422) before any AI call or DB write. Mock keeps it offline
+    # if validation ever regresses.
+    with patch("app.main.answer_customer_question",
+               return_value=CustomerAnswer("timing", "ok")):
+        r = client.post("/queries", json={"question": "q?",
+                                          "customer_email": "not-an-email"})
+    assert r.status_code == 422
+
+
+def test_admin_key_fallback_disabled_outside_pytest(monkeypatch):
+    # The old fallback served the hardcoded "test-admin-key" even in prod
+    # when ADMIN_API_KEY was unset. Now it activates only under pytest.
+    from app.main import _expected_admin_key
+
+    monkeypatch.delenv("ADMIN_API_KEY", raising=False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    assert _expected_admin_key() is None
+
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_x")
+    assert _expected_admin_key() == "test-admin-key"

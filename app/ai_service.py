@@ -227,10 +227,25 @@ def answer_customer_question(
     return CustomerAnswer(intent=intent, answer_text=answer_text)
 
 
-def _generate_with_errors(question: str) -> str:
-    """Same Gemini call + typed error mapping as generate_support_response."""
+def _generate_once(question: str, *, json_mode: bool = False) -> types.GenerateContentResponse:
+    # Option A (quota-safe): exactly ONE Gemini call, no inner retry.
+    # Queue-level retries (max 3, minutes apart) own all retry budget.
+    config = types.GenerateContentConfig(
+        temperature=0.2,
+        max_output_tokens=300,
+        **({"response_mime_type": "application/json"} if json_mode else {}),
+    )
+    return client.models.generate_content(
+        model="gemini-3.5-flash-lite",
+        contents=question,
+        config=config,
+    )
+
+
+def _map_generate_errors(question: str, *, single_attempt: bool) -> str:
+    """Shared typed-error mapping for 3-try and 1-try paths."""
     try:
-        response = _generate(question, json_mode=True)
+        response = _generate_once(question, json_mode=True) if single_attempt else _generate(question, json_mode=True)
     except (TimeoutError, ConnectionError,
             httpx.TimeoutException, httpx.ConnectError) as e:
         raise AITimeoutError("AI provider timed out or connection failed") from e
@@ -251,3 +266,57 @@ def _generate_with_errors(question: str) -> str:
     if not text:
         raise AIContentBlockedError("Model returned an empty answer")
     return text
+
+
+def answer_customer_question_once(
+    question: str,
+    policy_context: str | None = None,
+    situation: str | None = None,
+) -> CustomerAnswer:
+    """Single-attempt variant for queue workers (Option A: max 3 total calls).
+
+    Same prompt/parse contract as answer_customer_question, but exactly ONE
+    Gemini call -- queue-level backoff owns all retry budget.
+    """
+    prompt = _INTENT_PROMPT.format(
+        labels="\n".join(
+            f'- "{label}": {INTENT_HINTS[label]}' for label in INTENT_LABELS
+        ),
+        situation_line=(
+            f"Customer situation: {situation}" if situation else ""
+        ),
+        policy=policy_context or "(no policy provided - be honest that you "
+               "cannot confirm and offer human follow-up)",
+        question=question,
+    )
+    raw = _generate_with_errors_once(prompt)
+
+    # Parse the model's JSON; fall back gracefully instead of failing the
+    # customer request if the model wrapped it in fences or added stray text.
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:].strip()
+    try:
+        payload = json.loads(text)
+        intent = str(payload.get("intent", "unknown"))
+        answer_text = str(payload.get("answer", "")).strip()
+    except (json.JSONDecodeError, AttributeError):
+        intent, answer_text = "unknown", raw.strip()
+
+    if intent not in INTENT_LABELS:
+        intent = "unknown"
+    if not answer_text:
+        raise AIContentBlockedError("Model returned an empty answer")
+    return CustomerAnswer(intent=intent, answer_text=answer_text)
+
+
+def _generate_with_errors(question: str) -> str:
+    """Same Gemini call + typed error mapping as generate_support_response."""
+    return _map_generate_errors(question, single_attempt=False)
+
+
+def _generate_with_errors_once(question: str) -> str:
+    """Single-attempt variant for queue workers (Option A quota guard)."""
+    return _map_generate_errors(question, single_attempt=True)
