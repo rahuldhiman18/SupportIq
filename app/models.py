@@ -112,7 +112,7 @@ class Support_Answer(Base):
     __tablename__ = "support_answers"
 
     id: Mapped[UUID] = mapped_column(primary_key=True,default=uuid4)
-    query_id: Mapped[UUID] = mapped_column(ForeignKey("support_queries.id"),nullable=False)
+    query_id: Mapped[UUID] = mapped_column(ForeignKey("support_queries.id"),nullable=False, index=True)
     answer_text:Mapped[str] = mapped_column()
     is_selected: Mapped[bool] = mapped_column(default=False)
     # utcnow_unique: GET /queries/{id}/answer orders by created_at DESC; the
