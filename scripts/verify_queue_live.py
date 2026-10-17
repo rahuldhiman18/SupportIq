@@ -258,16 +258,26 @@ finally:
     s.close()
 
 got = []
-for _ in range(3):
+# Option (a) test isolation (approved): the dev queue is SHARED -- foreign
+# rows (real manual-test history, other experiments) may legitimately
+# interleave with our seeded rows. Drain the whole queue (that IS what the
+# worker does), then assert only our rows' RELATIVE order. Foreign claims
+# are reported, not failed on. Long-term fix (P1): dedicated verify DB.
+while True:
     s = SessionLocal()
     try:
         q = worker.claim_next(s)
-        got.append(q.question.split()[0] if q else None)
     finally:
         s.close()
-check(got == ["P-crit", "P-base-old", "P-base-new"],
+    if q is None:
+        break
+    got.append(q.question.split()[0])
+_SEEDS = ("P-crit", "P-base-old", "P-base-new")
+ours = [g for g in got if g in _SEEDS]
+foreign = [g for g in got if g not in _SEEDS]
+check(ours == ["P-crit", "P-base-old", "P-base-new"],
       "worker.claim_next: critical first, then oldest base-tier (aging)",
-      str(got))
+      f"ours={ours} foreign_drained={foreign or 'none'}")
 
 # 2) exactly-once hammer: 6 threads over N queued rows, zero dupes/missing
 wipe_worker_rows()
@@ -377,6 +387,80 @@ try:
         s.close()
 finally:
     worker.answer_customer_question_once = _orig_once
+
+# 5) P0 reaper: stale `processing` rows reclaimed inside claim_next
+wipe_worker_rows()
+
+
+def _seed_processing(label, locked_age_seconds, attempts=0, locked=True):
+    s = SessionLocal()
+    try:
+        q = SupportQuery(question=label + " " + EMAIL_MARK,
+                         customer_email=label + EMAIL_MARK,
+                         status="processing", attempts=attempts,
+                         locked_at=(datetime.now(timezone.utc)
+                                    - timedelta(seconds=locked_age_seconds))
+                         if locked else None)
+        s.add(q)
+        s.commit()
+        return q.id
+    finally:
+        s.close()
+
+
+# a) stale past 60s -> reclaimed (+1 attempt) AND claimed in one pass
+_qid_a = _seed_processing("stale61", 61)
+s = SessionLocal()
+try:
+    q = worker.claim_next(s)
+    check(q is not None and q.customer_email.startswith("stale61")
+          and q.attempts == 1 and q.status == "processing",
+          "reaper: 61s-old processing row reclaimed (+1 attempt) and claimed",
+          f"row={q.customer_email if q else None}/attempts={q.attempts if q else '-'}")
+finally:
+    s.close()
+
+# b) fresh (30s) row left alone -- the 60s invariant window is respected
+wipe_worker_rows()
+_qid_b = _seed_processing("fresh30", 30)
+s = SessionLocal()
+try:
+    q = worker.claim_next(s)
+    check(q is None, "reaper: 30s-old processing row untouched (inside window)",
+          f"claimed={q.customer_email if q else None}")
+finally:
+    s.close()
+
+# c) crash-loop row: 2 attempts already -> reclaim pushes to 3 -> needs_human
+wipe_worker_rows()
+_qid_c = _seed_processing("poison", 90, attempts=worker.MAX_AI_ATTEMPTS - 1)
+s = SessionLocal()
+try:
+    q = worker.claim_next(s)
+    s2 = SessionLocal()
+    try:
+        row = s2.get(SupportQuery, _qid_c)
+        check(q is None and row.status == "needs_human"
+              and row.attempts == worker.MAX_AI_ATTEMPTS,
+              "reaper: crash-loop row hits 3-strike budget -> needs_human",
+              f"status={row.status}/attempts={row.attempts}")
+    finally:
+        s2.close()
+finally:
+    s.close()
+
+# d) corrupt row (processing + NULL locked_at) reclaimed immediately
+wipe_worker_rows()
+_qid_d = _seed_processing("nulllock", 0, locked=False)
+s = SessionLocal()
+try:
+    q = worker.claim_next(s)
+    check(q is not None and q.customer_email.startswith("nulllock")
+          and q.attempts == 1,
+          "reaper: processing row with NULL locked_at reclaimed immediately",
+          f"claimed={q.customer_email if q else None}")
+finally:
+    s.close()
 
 wipe_worker_rows()
 print("      cleanup: phase-3 rows removed")

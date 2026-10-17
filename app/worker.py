@@ -46,6 +46,30 @@ MAX_AI_ATTEMPTS = 3
 # staying quota-safe on the free tier.
 RETRY_BACKOFF_MINUTES = (2, 4, 8)
 
+# Queue invariant (approved design): no row stays in `processing` beyond
+# this. A legit attempt finishes in ~11s worst case (10s hard Gemini timeout
+# + ms of DB work), so 60s = 5.5x headroom; tune from live data later.
+STALE_PROCESSING_SECONDS = 60
+
+# Reaper (P0): reclaims rows a crashed or hung worker left behind. Runs
+# inside claim_next's transaction. A reclaimed row burns one attempt against
+# the SAME 3-strike budget -- crashes count, so a poison row hands off to a
+# human instead of crash-looping. Idempotent: status leaves `processing`, so
+# concurrent workers cannot double-count. NULL locked_at = corrupt row ->
+# reclaimed immediately. NEWEST-ANSWER-WINS covers the pathological case
+# where the "dead" worker was actually alive and finishes later.
+RECLAIM_STALE_SQL = """
+    UPDATE support_queries
+       SET attempts = attempts + 1,
+           last_error = 'reclaimed: stuck in processing (worker crash/hang)',
+           status = CASE WHEN attempts + 1 >= :max_attempts
+                         THEN :needs_human ELSE :queued END,
+           next_retry_at = NULL,
+           locked_at = NULL
+     WHERE status = :processing
+       AND (locked_at IS NULL OR locked_at < :cutoff)
+"""
+
 
 def record_attempt_failure(query: SupportQuery, exc: Exception) -> str:
     """Book one failed AI attempt on `query` (caller owns the transaction).
@@ -123,6 +147,16 @@ def claim_next(db: Session, now: datetime | None = None) -> SupportQuery | None:
     vanishing mid-flight.
     """
     at = now or datetime.now(timezone.utc)
+    # 1) reaper first: stale `processing` rows re-enter the queue in the
+    #    SAME transaction as the claim -- no window where they float free.
+    db.execute(text(RECLAIM_STALE_SQL), {
+        "processing": STATUS_PROCESSING,
+        "queued": STATUS_QUEUED,
+        "needs_human": STATUS_NEEDS_HUMAN,
+        "max_attempts": MAX_AI_ATTEMPTS,
+        "cutoff": at - timedelta(seconds=STALE_PROCESSING_SECONDS),
+    })
+    # 2) then claim the best row exactly once (FOR UPDATE SKIP LOCKED).
     row = db.execute(
         text(CLAIM_NEXT_SQL),
         {
@@ -164,6 +198,16 @@ def process_one(db: Session, query: SupportQuery) -> str:
         )
     except (AIRateLimitError, AITimeoutError,
             AIContentBlockedError, AIProviderError) as exc:
+        record_attempt_failure(query, exc)
+        db.commit()
+        return query.status
+    except Exception as exc:
+        # Seatbelt (the P0 pair to the 60s reaper): UNMAPPED failures (our
+        # own bugs, parse errors) still book an attempt instead of stranding
+        # the row until the reaper notices. KeyboardInterrupt/SystemExit are
+        # BaseException and deliberately NOT caught -- shutting down should
+        # abandon the row, and the reaper owns it from there.
+        logger.exception("unexpected worker failure for query %s", query.id)
         record_attempt_failure(query, exc)
         db.commit()
         return query.status

@@ -13,7 +13,9 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = '2826b6baca68'
-down_revision: Union[str, Sequence[str], None] = None
+# Rewired from None: chapter zero (0000aa11bb22) now creates the legacy
+# tables this revision assumes already exist, so fresh databases replay.
+down_revision: Union[str, Sequence[str], None] = '0000aa11bb22'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

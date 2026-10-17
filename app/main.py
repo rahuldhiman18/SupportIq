@@ -606,6 +606,36 @@ def list_needs_human(db: Session = Depends(get_db),
     return {"count": len(items), "items": items}
 
 
+@app.post("/queries/{query_id}/requeue", response_model=QueryResponse)
+def requeue_query(query_id: UUID, db = Depends(get_db),
+                  _admin: None = Depends(require_admin_key)):
+    # Narrow admin recovery path (P0 design, approved): ONLY `processing`
+    # (stuck rows the reaper or an operator flags) and `needs_human` (agent
+    # wants one fresh AI attempt after e.g. a policy fix) may re-enter the
+    # queue. resolved/closed stay final -- reopening by accident is
+    # impossible by construction, which is why the PATCH status enum stays
+    # narrow. attempts is preserved as the audit trail; the next worker
+    # claim gives exactly one fresh live attempt (a failure at 3+ returns
+    # the row to needs_human via the normal budget rule).
+    result = db.execute(select(SupportQuery).where(SupportQuery.id == query_id))
+    query = result.scalar_one_or_none()
+    if query is None:
+        raise HTTPException(status_code=404, detail="Query not found")
+    if query.status not in ("processing", "needs_human"):
+        raise HTTPException(status_code=409,
+                            detail=f"Cannot requeue a '{query.status}' query")
+    query.status = "queued"
+    query.next_retry_at = None
+    query.locked_at = None
+    db.commit()
+    db.refresh(query)
+    return {"query_id": query.id,
+            "question": query.question,
+            "status": query.status,
+            "created_at": query.created_at,
+            "intent": query.intent}
+
+
 @app.post("/knowledge",status_code=201)
 def create_knowledge(request: KnowledgeCreate,db: Session = Depends(get_db),
                      _admin: None = Depends(require_admin_key),):
@@ -646,9 +676,3 @@ def create_knowledge(request: KnowledgeCreate,db: Session = Depends(get_db),
     except Exception:
         db.rollback()
         raise 
-
-
-    
-    
-
-    
