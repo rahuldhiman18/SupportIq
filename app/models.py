@@ -314,6 +314,43 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+# --- Refresh tokens: opaque + DB (approved design) ---------------------------
+# Why opaque and not a JWT: the server must be able to REVOKE a refresh token
+# (logout, theft-reuse family kill, user deactivation). A stateless JWT cannot
+# be revoked -- a valid signature stays valid until expiry. So the token string
+# is just secrets.token_urlsafe(32) randomness; ALL meaning lives in this row.
+# Only the SHA-256 hash is stored (DB leak != session leak), mirroring the
+# password lesson.
+#
+# Rotation chain: one login creates family F, token T1. Each refresh creates
+# T2 (same family), sets T1.replaced_by=T2. Presenting an already-replaced
+# token = reuse = theft signal -> whole family revoked (strict mode).
+# Expiry is ABSOLUTE, anchored to the family root's expires_at (never sliding),
+# so a stolen token cannot live forever by staying active.
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    # sha256 hex of the raw token -- unique doubles as the O(log n) lookup key
+    # on the hot refresh path.
+    token_hash: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True)
+    # Groups every rotation from one login; indexed for cheap family-kill UPDATE.
+    family_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    # Points at the next token after rotation; NULL = current head of chain.
+    replaced_by: Mapped[UUID | None] = mapped_column(nullable=True)
+
+    user: Mapped["User"] = relationship()
     
 
 
