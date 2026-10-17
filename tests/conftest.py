@@ -11,6 +11,12 @@ import os
 # Must happen before any `app.*` import (ai_service fails fast on missing key)
 os.environ.setdefault("GEMINI_API_KEY", "dummy-key-for-tests-no-network")
 os.environ.setdefault("DATABASE_URL", "sqlite://")
+# .env carries a real ADMIN_API_KEY and load_dotenv() runs at app import,
+# leaking it into this process. Tests must own their env deterministically:
+# FORCE the known test key so results never depend on the machine's .env or
+# shell state (this also permanently fixes the old shell-leak fragility).
+# Test-process only -- production fail-closed behavior is unaffected.
+os.environ["ADMIN_API_KEY"] = "test-admin-key"
 
 import pytest
 from fastapi.testclient import TestClient
