@@ -16,6 +16,7 @@ narrow until that endpoint gets admin auth (it currently has none).
 """
 import logging
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
@@ -227,6 +228,7 @@ def run_once(db: Session | None = None) -> bool:
         query = claim_next(db)
         if query is None:
             return False
+        _beat(claimed=True)
         process_one(db, query)
         return True
     finally:
@@ -235,6 +237,33 @@ def run_once(db: Session | None = None) -> bool:
 
 
 POLL_SECONDS = 1.0
+
+# --- Worker heartbeat (health observability) --------------------------------
+# In-memory timestamps (time.monotonic: immune to NTP jumps). Two signals:
+#   last_loop_at  -- worker thread is iterating (alive vs dead)
+#   last_claim_at -- worker did USEFUL work (claim succeeded; idle vs active)
+# "Looping but queue empty" (loop fresh, claim stale) = healthy idle.
+# "Not looping at all" (loop stale) = dead thread. Only the heartbeat's
+# FRESHNESS is a signal; a live-but-erroring worker keeps beating (the loop
+# body already logs + continues) while errors surface in logs/queue-stats.
+# Stale threshold lives with the READER (routes_health), not here.
+_heartbeat: dict[str, float | None] = {"last_loop_at": None,
+                                       "last_claim_at": None}
+_HEARTBEAT_LOCK = threading.Lock()
+
+
+def get_heartbeat() -> dict[str, float | None]:
+    with _HEARTBEAT_LOCK:
+        return dict(_heartbeat)
+
+
+def _beat(loop: bool = False, claimed: bool = False) -> None:
+    now = time.monotonic()
+    with _HEARTBEAT_LOCK:
+        if loop:
+            _heartbeat["last_loop_at"] = now
+        if claimed:
+            _heartbeat["last_claim_at"] = now
 
 
 def run_forever(stop_event: threading.Event,
@@ -247,6 +276,7 @@ def run_forever(stop_event: threading.Event,
     """
     logger.info("queue worker started (poll every %.1fs)", poll_seconds)
     while not stop_event.is_set():
+        _beat(loop=True)
         try:
             worked = run_once()
         except Exception:  # a crashed loop is worse than a slow one

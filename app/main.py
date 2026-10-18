@@ -14,7 +14,7 @@ import threading
 
 from fastapi import FastAPI
 
-from . import routes_auth, routes_knowledge, routes_orders, routes_queries
+from . import routes_auth, routes_health, routes_knowledge, routes_orders, routes_queries
 from .deps import _query_mode, _rate_hits, get_db  # noqa: F401 (re-exported for tests)
 from .prompt_context import build_prompt_context, _extract_order_number  # noqa: F401
 from .security import (  # noqa: F401 (re-exported for tests/scripts)
@@ -44,6 +44,7 @@ from .routes_queries import answer_customer_question  # noqa: F401
 app = FastAPI(title="SupportIq")
 
 app.include_router(routes_auth.router)
+app.include_router(routes_health.router)
 app.include_router(routes_orders.router)
 app.include_router(routes_queries.router)
 app.include_router(routes_knowledge.router)
