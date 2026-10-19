@@ -58,7 +58,18 @@ def create_query(request: SupportRequest, http_request: Request,
         order_number=query.order_number,
         purchase_date=query.purchase_date,
         order_status=query.order_status,
+        # Agent-style resolution (approved): auto-lookup runs ONLY when the
+        # JWT-verified email matches the query's email -- body email alone is
+        # spoofable, so anonymous callers get a polite ask instead.
+        auth_email=(identity or {}).get("email"),
     )
+
+    if ctx.resolved_order_number and not query.order_number:
+        # Auto-matched the customer's only open order: persist it so the
+        # queued worker rebuilds the same facts WITHOUT a JWT at claim time.
+        query.order_number = ctx.resolved_order_number
+        db.commit()
+        db.refresh(query)
 
     if ctx.knowledge_version_id is not None:
         # schema allows one FK per query: store the first as the primary one

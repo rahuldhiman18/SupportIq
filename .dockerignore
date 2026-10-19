@@ -1,0 +1,28 @@
+# Secrets never enter the image. compose passes env at runtime from the host .env
+.env
+.env.example
+*.env
+
+# Local-only / junk that must never ship
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.log
+_server_err.log
+_server_out.log
+_order.json
+backups/
+.pytest_cache/
+.git/
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Root test strays + helper scripts (the image runs app/ + alembic/ only)
+create_table.py
+test_db.py
+test_gemini.py
+seed_refund_policy.py
+_verify_*.py
+_*.py

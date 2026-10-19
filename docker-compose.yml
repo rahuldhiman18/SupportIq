@@ -1,0 +1,59 @@
+# Local prod-like stack: api + Postgres + Mailpit (mail sink for the outbox).
+# Run:  docker compose up --build      -> app at http://127.0.0.1:8765
+#       docker compose down -v         -> wipe containers + db volume (clean slate)
+# 8GB-safe: this file is small on its own; cap WSL2 memory (see .wslconfig) so
+# the Docker VM cannot starve Windows.
+
+services:
+  api:
+    build: .
+    ports:
+      - "8765:8000"          # host 8765 -> container 8000 (approved)
+    environment:
+      DATABASE_URL: postgresql+psycopg://supportiq:supportiq@db:5432/supportiq
+      # inline default = Phase A behavior; flip to queued as the 2nd smoke.
+      QUERY_MODE: ${QUERY_MODE:-inline}
+      REFRESH_TOKEN_MINUTES: ${REFRESH_TOKEN_MINUTES:-720}
+      # Secrets come from the host .env via compose variable substitution
+      # below. NEVER hardcode them here, and .env never enters the image.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY in .env}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY in .env}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY in .env}
+      # Mailpit SMTP -- local sink, no real mail, zero quota. The outbox/mailer
+      # (upcoming) will point here by default.
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+    depends_on:
+      db:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: supportiq
+      POSTGRES_PASSWORD: supportiq
+      POSTGRES_DB: supportiq
+    ports:
+      - "5433:5432"          # host 5433 avoids clashing with any local Postgres (5432)
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Gates the api on a real DB (service_healthy), so alembic never races.
+      test: ["CMD-SHELL", "pg_isready -U supportiq -d supportiq"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "1025:1025"          # SMTP (the app sends here)
+      - "8025:8025"          # web UI -- see every captured mail, nothing sent for real
+    restart: unless-stopped
+
+volumes:
+  pgdata:
