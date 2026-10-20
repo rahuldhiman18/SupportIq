@@ -30,6 +30,7 @@ from .ai_service import (
     answer_customer_question_once,
 )
 from .database import SessionLocal
+from .mail import process_outbox, queue_email, resolution_email
 from .models import AGING_SECONDS_PER_POINT, SupportQuery, Support_Answer
 from .prompt_context import build_prompt_context
 
@@ -115,6 +116,26 @@ def record_success(query: SupportQuery, intent: str) -> str:
     query.locked_at = None
     query.last_error = None
     return query.status
+
+
+def _queue_resolution_email(db: Session, query: SupportQuery, answer_text: str) -> None:
+    """Queue the 'query resolved' email for a worker-resolved query.
+
+    Idempotency key f\"resolved:{query.id}\" prevents duplicates on retry.
+    """
+    email = resolution_email(
+        query_id=query.id,
+        customer_email=query.customer_email,
+        question=query.question,
+        answer_text=answer_text,
+    )
+    queue_email(
+        db,
+        to=email["to"],
+        subject=email["subject"],
+        body_text=email["body"],
+        idempotency_key=f"resolved:{query.id}",
+    )
 
 
 # ===================== Step 3b: claim + drain loop ===========================
@@ -217,11 +238,19 @@ def process_one(db: Session, query: SupportQuery) -> str:
     record_success(query, result.intent)
     db.commit()
     db.refresh(query)
+    # Queue the resolution email (idempotent: safe on retries).
+    _queue_resolution_email(db, query, result.answer_text)
     return query.status
 
 
 def run_once(db: Session | None = None) -> bool:
-    """Claim + process ONE row. False means the queue had nothing ready."""
+    """Claim + process ONE row, then drain the email outbox.
+
+    False means the queue had nothing ready.  `process_outbox` delivers any
+    `queued` resolution emails and retries `failed` ones (bounded at 5
+    attempts), so resolution mail reaches customers even when SMTP was down
+    at queue time.
+    """
     own_session = db is None
     db = db or SessionLocal()
     try:
@@ -230,6 +259,11 @@ def run_once(db: Session | None = None) -> bool:
             return False
         _beat(claimed=True)
         process_one(db, query)
+        # Deliver / retry resolution emails after every processed query.
+        try:
+            process_outbox(db)
+        except Exception:  # noqa: BLE001 -- never let mail break the worker
+            logger.exception("email outbox processing failed")
         return True
     finally:
         if own_session:

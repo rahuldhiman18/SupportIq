@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .security import _ACCESS_TOKEN_MINUTES, _DEFAULT_REFRESH_MINUTES
 
@@ -101,6 +101,23 @@ class AnswerResponse(BaseModel):
     id: UUID
     query_id: UUID
     answer_text: str
+    created_at: datetime
+
+
+# --- Step 4: feedback + email-outbox schemas --------------------------------
+
+class FeedbackCreate(BaseModel):
+    rating: int = Field(ge=1, le=5)
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class FeedbackResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    query_id: UUID
+    rating: int
+    comment: str | None
     created_at: datetime
 
 

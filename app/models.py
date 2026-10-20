@@ -351,6 +351,46 @@ class RefreshToken(Base):
     replaced_by: Mapped[UUID | None] = mapped_column(nullable=True)
 
     user: Mapped["User"] = relationship()
-    
+
+
+# --- Step 4: outbox + feedback (idempotent email + post-resolution survey) ---
+# EmailOutbox is the source of truth for every outbound customer email.
+# One row = one intended delivery. idempotency_key makes retries safe: the
+# same key never produces two emails. status = queued | sent | failed.
+class EmailOutbox(Base):
+    __tablename__ = "email_outbox"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    # Client-provided idempotency key: same key -> same email, never duplicated.
+    idempotency_key: Mapped[str] = mapped_column(String, unique=True, nullable=False, index=True)
+    to: Mapped[str] = mapped_column(String, nullable=False)
+    subject: Mapped[str] = mapped_column(String, nullable=False)
+    body_text: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(default="queued", nullable=False)  # queued | sent | failed
+    attempts: Mapped[int] = mapped_column(default=0, nullable=False)
+    error: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+
+
+class Feedback(Base):
+    """Post-resolution customer survey: rating 1-5 + optional comment."""
+    __tablename__ = "feedback"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    query_id: Mapped[UUID] = mapped_column(
+        ForeignKey("support_queries.id", ondelete="CASCADE"), nullable=False, index=True)
+    rating: Mapped[int] = mapped_column(nullable=False)  # 1..5
+    comment: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        CheckConstraint("rating >= 1 AND rating <= 5", name="ck_feedback_rating_range"),
+    )
+
+    query: Mapped["SupportQuery"] = relationship()
 
 

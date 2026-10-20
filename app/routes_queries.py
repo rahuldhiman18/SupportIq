@@ -1,5 +1,5 @@
 """Query routes: create / read / status / answers / admin feed / requeue."""
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import desc, select
@@ -13,14 +13,44 @@ from app.ai_service import (
     AIContentBlockedError,
 )
 from .deps import _query_mode, get_db, throttle_public_chat
-from .models import SupportQuery, Support_Answer, compute_base_priority
+from .models import Feedback, SupportQuery, Support_Answer, compute_base_priority
 # Prompt-context builder shared by the inline and queued paths (Step 3b).
 from .prompt_context import build_prompt_context
 from .schemas import (
-    AnswerResponse, HumanAnswerRequest, QueryResponse, QueryUpdate,
-    SupportRequest,
+    AnswerResponse, FeedbackCreate, FeedbackResponse, HumanAnswerRequest,
+    QueryResponse, QueryUpdate, SupportRequest,
 )
 from .security import current_identity, require_admin_key
+
+# Step 4: resolution email + feedback (outbox is idempotent -- safe on retry).
+from .mail import queue_email, resolution_email
+
+
+def _queue_resolution_email(db: Session, query: SupportQuery) -> None:
+    """Send (idempotently) the 'your query is resolved' email.
+
+    Key is f\"resolved:{query.id}\" so a retry never duplicates the mail.
+    """
+    email = resolution_email(
+        query_id=query.id,
+        customer_email=query.customer_email,
+        question=query.question,
+        answer_text=(
+            db.execute(
+                select(Support_Answer.answer_text)
+                .where(Support_Answer.query_id == query.id)
+                .order_by(Support_Answer.created_at.desc())
+            ).scalars().first()
+            or ""
+        ),
+    )
+    queue_email(
+        db,
+        to=email["to"],
+        subject=email["subject"],
+        body_text=email["body"],
+        idempotency_key=f"resolved:{query.id}",
+    )
 
 router = APIRouter(tags=["queries"])
 
@@ -117,6 +147,7 @@ def create_query(request: SupportRequest, http_request: Request,
 
     generate_text = result.answer_text
     query.intent = result.intent
+    query.status = "resolved"  # Step 4: inline AI resolution is final
     db.commit()
     db.refresh(query)
 
@@ -125,6 +156,9 @@ def create_query(request: SupportRequest, http_request: Request,
     db.add(answer)
     db.commit()
     db.refresh(answer)
+
+    # Queue the resolution email (idempotent: safe on retries).
+    _queue_resolution_email(db, query)
 
     return {
     "query_id": query.id,
@@ -227,10 +261,52 @@ def human_answer_query(query_id: UUID, request: HumanAnswerRequest,
         query.status = "resolved"
         db.commit()
         db.refresh(answer)
+        # Queue the resolution email (idempotent: safe on retries).
+        _queue_resolution_email(db, query)
     except Exception:
         db.rollback()
         raise
     return answer
+
+
+@router.patch("/queries/{query_id}/feedback", response_model=FeedbackResponse)
+def submit_feedback(
+    query_id: UUID,
+    request: FeedbackCreate,
+    db: Session = Depends(get_db),
+):
+    """Customer rates a resolved query (1-5) with an optional comment.
+
+    One feedback row per query: a second submission on the same query_id is
+    a no-op (idempotent by construction -- the row already exists).
+    """
+    query = db.execute(
+        select(SupportQuery).where(SupportQuery.id == query_id)
+    ).scalar_one_or_none()
+    if query is None:
+        raise HTTPException(status_code=404, detail="Query not found")
+    if query.status != "resolved":
+        raise HTTPException(
+            status_code=409,
+            detail="Feedback is only accepted on resolved queries",
+        )
+
+    existing = db.execute(
+        select(Feedback).where(Feedback.query_id == query_id)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return FeedbackResponse.model_validate(existing)
+
+    fb = Feedback(
+        id=uuid4(),
+        query_id=query_id,
+        rating=request.rating,
+        comment=request.comment,
+    )
+    db.add(fb)
+    db.commit()
+    db.refresh(fb)
+    return FeedbackResponse.model_validate(fb)
 
 
 @router.get("/admin/needs-human")

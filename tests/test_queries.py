@@ -820,3 +820,167 @@ def test_admin_key_fallback_disabled_outside_pytest(monkeypatch):
 
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_x")
     assert _expected_admin_key() == "test-admin-key"
+
+
+# --- Step 4: inline resolution returns "resolved" --------------------------
+
+def test_inline_resolve_returns_status_resolved(client):
+    """POST /queries inline path now returns status: resolved (not pending)."""
+    fake = CustomerAnswer(intent="eligibility", answer_text="You are covered.")
+    with patch("app.main.answer_customer_question", return_value=fake):
+        response = client.post("/queries", json={
+            "customer_email": "a@b.com", "question": "refund?"})
+    assert response.status_code == 202
+    assert response.json()["status"] == "resolved"
+
+
+# --- Step 4: email outbox idempotency + delivery --------------------------
+
+def test_queue_email_is_idempotent(db_session):
+    """Same idempotency_key never produces two outbox rows."""
+    from app.mail import queue_email
+    row1 = queue_email(
+        db_session,
+        to="a@b.com",
+        subject="S",
+        body_text="B",
+        idempotency_key="resolved:test-1",
+    )
+    row2 = queue_email(
+        db_session,
+        to="a@b.com",
+        subject="S",
+        body_text="B",
+        idempotency_key="resolved:test-1",
+    )
+    assert row1 is not None
+    assert row1.status == "queued"
+    assert row2 is None  # duplicate key -> no duplicate row
+
+
+def test_process_outbox_delivers_queued_email(db_session, monkeypatch):
+    """process_outbox delivers queued rows and marks them sent."""
+    from app.mail import queue_email, process_outbox, _send_smtp
+    sent = []
+
+    def fake_send(to, subject, body_text):
+        sent.append((to, subject, body_text))
+
+    monkeypatch.setattr("app.mail._send_smtp", fake_send)
+
+    row = queue_email(
+        db_session,
+        to="a@b.com",
+        subject="Hello",
+        body_text="Your query is resolved.",
+        idempotency_key="resolved:test-2",
+    )
+    assert row.status == "queued"
+
+    count = process_outbox(db_session)
+    assert count == 1
+    assert len(sent) == 1
+    assert sent[0][0] == "a@b.com"
+
+    db_session.refresh(row)
+    assert row.status == "sent"
+    assert row.sent_at is not None
+
+
+def test_process_outbox_marks_failed_on_smtp_error(db_session, monkeypatch):
+    """process_outbox records failure, increments attempts, keeps going."""
+    from app.mail import queue_email, process_outbox, _send_smtp
+
+    def boom(to, subject, body_text):
+        raise ConnectionError("mail server down")
+
+    monkeypatch.setattr("app.mail._send_smtp", boom)
+
+    row = queue_email(
+        db_session,
+        to="a@b.com",
+        subject="S",
+        body_text="B",
+        idempotency_key="resolved:test-3",
+    )
+    assert row.status == "queued"
+
+    count = process_outbox(db_session)
+    assert count == 0  # no successful sends (SMTP down)
+
+    db_session.refresh(row)
+    assert row.status == "failed"
+    assert row.attempts == 1  # one attempt was made and recorded
+    assert "ConnectionError" in row.error
+
+
+# --- Step 4: feedback endpoint ---------------------------------------------
+
+def test_feedback_endpoint_creates_and_is_idempotent(client, db_session):
+    """Customer rates a resolved query; repeat submission returns existing."""
+    q = SupportQuery(
+        question="refund?", customer_email="a@b.com", status="resolved",
+    )
+    db_session.add(q)
+    db_session.commit()
+    db_session.refresh(q)
+
+    r = client.patch(
+        f"/queries/{q.id}/feedback",
+        json={"rating": 5, "comment": "great"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["query_id"] == str(q.id)
+    assert body["rating"] == 5
+    assert body["comment"] == "great"
+
+    # Duplicate submission returns the existing row (idempotent by construction)
+    r2 = client.patch(
+        f"/queries/{q.id}/feedback",
+        json={"rating": 1, "comment": "terrible"},
+    )
+    assert r2.status_code == 200
+    assert r2.json()["rating"] == 5  # unchanged from first submission
+
+
+def test_feedback_409_on_unresolved_query(client, db_session):
+    """Feedback is only accepted on resolved queries."""
+    q = SupportQuery(
+        question="refund?", customer_email="a@b.com", status="pending",
+    )
+    db_session.add(q)
+    db_session.commit()
+    db_session.refresh(q)
+
+    r = client.patch(
+        f"/queries/{q.id}/feedback",
+        json={"rating": 5},
+    )
+    assert r.status_code == 409
+
+
+# --- Step 4: admin PATCH to resolved sends no mail --------------------------
+
+def test_admin_patch_resolved_no_mail(client, db_session):
+    """Manual staff resolution (PATCH /queries/{id}->resolved) queues no mail."""
+    from app.models import EmailOutbox
+
+    q = SupportQuery(
+        question="refund?", customer_email="a@b.com", status="pending",
+    )
+    db_session.add(q)
+    db_session.commit()
+    db_session.refresh(q)
+
+    r = client.patch(
+        f"/queries/{q.id}",
+        json={"status": "resolved"},
+        headers=ADMIN_HEADERS,
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "resolved"
+
+    # No email row was queued for a manual staff resolution
+    rows = db_session.query(EmailOutbox).all()
+    assert len(rows) == 0
