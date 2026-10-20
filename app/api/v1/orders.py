@@ -4,10 +4,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .deps import get_db
-from .models import Order, OrderEvent
-from .schemas import OrderCreate, OrderTrackResponse
-from .security import current_identity, require_admin_key
+from app.core.deps import get_db
+from app.models.tables import Order, OrderEvent
+from app.schemas.dto import OrderCreate, OrderTrackResponse
+from app.core.security import current_identity, require_admin_key
 
 router = APIRouter(tags=["orders"])
 

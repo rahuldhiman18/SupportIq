@@ -26,10 +26,10 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from . import worker as _worker
-from .deps import _query_mode, get_db
-from .models import SupportQuery
-from .security import require_admin_key
+from app.services import worker as _worker
+from app.core.deps import _query_mode, get_db
+from app.models.tables import SupportQuery
+from app.core.security import require_admin_key
 
 router = APIRouter(tags=["health"])
 

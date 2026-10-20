@@ -2,10 +2,10 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from .deps import get_db
-from .models import KnowledgeAnswer, KnowledgeAnswerVersion
-from .schemas import KnowledgeCreate
-from .security import require_admin_key
+from app.core.deps import get_db
+from app.models.tables import KnowledgeAnswer, KnowledgeAnswerVersion
+from app.schemas.dto import KnowledgeCreate
+from app.core.security import require_admin_key
 
 router = APIRouter(tags=["knowledge"])
 

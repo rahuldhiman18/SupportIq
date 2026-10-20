@@ -9,7 +9,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .security import _ACCESS_TOKEN_MINUTES, _DEFAULT_REFRESH_MINUTES
+from app.core.security import _ACCESS_TOKEN_MINUTES, _DEFAULT_REFRESH_MINUTES
 
 
 class LoginRequest(BaseModel):

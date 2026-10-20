@@ -11,8 +11,8 @@ from datetime import datetime, timezone
 
 from sqlalchemy import func, select
 
-from app.database import SessionLocal
-from app.models import KnowledgeAnswer, KnowledgeAnswerVersion
+from app.core.database import SessionLocal
+from app.models.tables import KnowledgeAnswer, KnowledgeAnswerVersion
 
 # Single combined draft used by every API call: structured like the big
 # marketplaces (Amazon returns + Google Play digital refunds) but written in

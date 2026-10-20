@@ -5,13 +5,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .deps import get_db, throttle_public_chat
-from .models import RefreshToken, User
-from .schemas import (
+from app.core.deps import get_db, throttle_public_chat
+from app.models.tables import RefreshToken, User
+from app.schemas.dto import (
     LoginRequest, LoginResponse, LogoutRequest, RefreshRequest,
     RefreshResponse,
 )
-from .security import (
+from app.core.security import (
     _hash_refresh_token, _refresh_ttl_minutes, issue_access_token,
     issue_refresh_token, rotate_refresh_token, verify_password,
 )

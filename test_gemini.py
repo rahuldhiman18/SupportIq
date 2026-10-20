@@ -5,7 +5,7 @@ pytest may import this file during collection, but the guard below
 prevents any API call unless the script is run on purpose.
 """
 
-from app.ai_service import generate_support_response
+from app.services.ai_service import generate_support_response
 
 
 def main() -> None:

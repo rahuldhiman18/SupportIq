@@ -6,7 +6,7 @@ Safe for pytest to import (nothing executes at import time).
 
 from sqlalchemy import text
 
-from app.database import engine
+from app.core.database import engine
 
 
 def main() -> None:

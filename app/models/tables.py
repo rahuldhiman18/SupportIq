@@ -1,7 +1,7 @@
 from uuid import UUID, uuid4
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String ,CheckConstraint,Index,UniqueConstraint
 from sqlalchemy.orm import Mapped , mapped_column, relationship
-from .database import Base
+from app.core.database import Base
 from datetime import datetime, timezone, timedelta, date
 import threading
 

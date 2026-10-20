@@ -5,25 +5,25 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-import app.ai_service as _ai_service
-from app.ai_service import (
+import app.services.ai_service as _ai_service
+from app.services.ai_service import (
     AITimeoutError,
     AIRateLimitError,
     AIProviderError,
     AIContentBlockedError,
 )
-from .deps import _query_mode, get_db, throttle_public_chat
-from .models import Feedback, SupportQuery, Support_Answer, compute_base_priority
+from app.core.deps import _query_mode, get_db, throttle_public_chat
+from app.models.tables import Feedback, SupportQuery, Support_Answer, compute_base_priority
 # Prompt-context builder shared by the inline and queued paths (Step 3b).
-from .prompt_context import build_prompt_context
-from .schemas import (
+from app.services.prompt_context import build_prompt_context
+from app.schemas.dto import (
     AnswerResponse, FeedbackCreate, FeedbackResponse, HumanAnswerRequest,
     QueryResponse, QueryUpdate, SupportRequest,
 )
-from .security import current_identity, require_admin_key
+from app.core.security import current_identity, require_admin_key
 
 # Step 4: resolution email + feedback (outbox is idempotent -- safe on retry).
-from .mail import queue_email, resolution_email
+from app.services.mail import queue_email, resolution_email
 
 
 def _queue_resolution_email(db: Session, query: SupportQuery) -> None:
