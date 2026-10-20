@@ -8,7 +8,7 @@ The 60s reclaim itself is Postgres-only (it rides the SKIP LOCKED claim
 transaction), so it is proven by scripts/verify_queue_live.py Phase 3
 against a real database -- SQLite cannot execute that SQL.
 """
-from app.worker import MAX_AI_ATTEMPTS, STALE_PROCESSING_SECONDS, process_one
+from app.services.worker import MAX_AI_ATTEMPTS, STALE_PROCESSING_SECONDS, process_one
 from app.models import SupportQuery
 
 
@@ -27,7 +27,7 @@ def test_unmapped_exception_books_attempt_not_strand(db_session, monkeypatch):
     def _explode(*args, **kwargs):
         raise RuntimeError("totally unexpected boom")
 
-    monkeypatch.setattr("app.worker.answer_customer_question_once", _explode)
+    monkeypatch.setattr("app.services.worker.answer_customer_question_once", _explode)
     # Seatbelt: ends `queued` for retry -- NOT `processing` (stranded).
     assert process_one(db_session, q) == "queued"
     db_session.refresh(q)
@@ -45,7 +45,7 @@ def test_unmapped_exception_at_budget_edge_hands_off(db_session, monkeypatch):
     def _explode(*args, **kwargs):
         raise ValueError("boom")
 
-    monkeypatch.setattr("app.worker.answer_customer_question_once", _explode)
+    monkeypatch.setattr("app.services.worker.answer_customer_question_once", _explode)
     assert process_one(db_session, q) == "needs_human"
     db_session.refresh(q)
     assert q.attempts == MAX_AI_ATTEMPTS
@@ -59,7 +59,7 @@ def test_success_path_unaffected_by_seatbelt(db_session, monkeypatch):
     db_session.add(q)
     db_session.commit()
     monkeypatch.setattr(
-        "app.worker.answer_customer_question_once",
+        "app.services.worker.answer_customer_question_once",
         lambda *a, **k: SimpleNamespace(intent="timing", answer_text="fine"),
     )
     assert process_one(db_session, q) == "resolved"

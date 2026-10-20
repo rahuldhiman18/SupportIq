@@ -10,9 +10,9 @@ from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import UUID
 
-from app.ai_service import AIProviderError, AITimeoutError
+from app.services.ai_service import AIProviderError, AITimeoutError
 from app.models import Order, OrderEvent, Support_Answer, SupportQuery
-from app.worker import MAX_AI_ATTEMPTS, process_one, run_once
+from app.services.worker import MAX_AI_ATTEMPTS, process_one, run_once
 
 
 def _seed_stalled_order(db, number="ORD-3B01", email="buyer@step3b.test"):
@@ -111,7 +111,7 @@ def test_worker_success_resolves_and_answers(db_session, monkeypatch):
     db_session.add(q)
     db_session.commit()
     monkeypatch.setattr(
-        "app.worker.answer_customer_question_once",
+        "app.services.worker.answer_customer_question_once",
         lambda *a, **k: SimpleNamespace(intent="eligibility",
                                         answer_text="14 days, per policy."),
     )
@@ -134,7 +134,7 @@ def test_worker_failure_books_backoff_not_a_500(db_session, monkeypatch):
     def _raise(*args, **kwargs):
         raise AITimeoutError("slow")
 
-    monkeypatch.setattr("app.worker.answer_customer_question_once", _raise)
+    monkeypatch.setattr("app.services.worker.answer_customer_question_once", _raise)
     assert process_one(db_session, q) == "queued"
     db_session.refresh(q)
     assert q.attempts == 1
@@ -154,7 +154,7 @@ def test_worker_exhausted_hands_off_to_human_feed(client, db_session,
     def _raise(*args, **kwargs):
         raise AIProviderError("500")
 
-    monkeypatch.setattr("app.worker.answer_customer_question_once", _raise)
+    monkeypatch.setattr("app.services.worker.answer_customer_question_once", _raise)
     assert process_one(db_session, q) == "needs_human"
     db_session.refresh(q)
     assert q.attempts == MAX_AI_ATTEMPTS
@@ -176,9 +176,9 @@ def test_run_once_drains_one_claim_then_stops(db_session, monkeypatch):
         calls["claims"] += 1
         return db.get(SupportQuery, q.id) if calls["claims"] == 1 else None
 
-    monkeypatch.setattr("app.worker.claim_next", fake_claim)
+    monkeypatch.setattr("app.services.worker.claim_next", fake_claim)
     monkeypatch.setattr(
-        "app.worker.answer_customer_question_once",
+        "app.services.worker.answer_customer_question_once",
         lambda *a, **k: SimpleNamespace(intent="out_of_scope",
                                         answer_text="A human will follow up."),
     )

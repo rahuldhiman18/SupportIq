@@ -28,9 +28,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 load_dotenv()
 EMAIL_MARK = "queue-live-test@"
 
-from app import worker  # noqa: E402
-from app.ai_service import AIProviderError  # noqa: E402
-from app.database import SessionLocal  # noqa: E402
+from app.services import worker  # noqa: E402
+from app.services.ai_service import AIProviderError  # noqa: E402
+from app.core.database import SessionLocal  # noqa: E402
 from app.models import (  # noqa: E402
     Support_Answer, SupportQuery, compute_base_priority, effective_score)
 

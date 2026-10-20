@@ -13,7 +13,7 @@ import time
 import pytest
 
 import app.main as main
-from app import worker as _worker
+from app.services import worker as _worker
 
 
 def test_healthz_open_inline_reports_disabled(client):
@@ -75,7 +75,7 @@ def test_queue_stats_counts_and_ages(client, db_session):
 
 
 def test_heartbeat_fresh_vs_stale(monkeypatch):
-    import app.routes_health as health
+    from app.api.v1 import health as health
 
     monkeypatch.setenv("QUERY_MODE", "queued")
     now = time.monotonic()

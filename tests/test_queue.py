@@ -1,14 +1,14 @@
 """Unit tests for Option A queue transitions: retry budget, backoff, human handoff."""
 from datetime import datetime, timedelta, timezone
 
-from app.ai_service import (
+from app.services.ai_service import (
     AIContentBlockedError,
     AIProviderError,
     AIRateLimitError,
     AITimeoutError,
 )
 from app.models import SupportQuery
-from app.worker import (
+from app.services.worker import (
     MAX_AI_ATTEMPTS,
     RETRY_BACKOFF_MINUTES,
     record_attempt_failure,
@@ -82,8 +82,8 @@ def test_success_marks_resolved_and_clears_error_state():
 def test_once_path_makes_exactly_one_gemini_call():
     # Worker path must never burn more than ONE quota unit per attempt.
     from unittest.mock import patch
-    import app.ai_service as ai_service
-    from app.ai_service import answer_customer_question_once
+    import app.services.ai_service as ai_service
+    from app.services.ai_service import answer_customer_question_once
 
     with patch.object(ai_service.client.models, "generate_content",
                       side_effect=TimeoutError("slow")) as m:
@@ -99,8 +99,8 @@ def test_sync_path_still_burns_up_to_three_calls():
     # 3 retries; the queue worker path (above) is the quota-safe one.
     import httpx
     from unittest.mock import patch
-    import app.ai_service as ai_service
-    from app.ai_service import answer_customer_question
+    import app.services.ai_service as ai_service
+    from app.services.ai_service import answer_customer_question
 
     with patch.object(ai_service.client.models, "generate_content",
                       side_effect=httpx.ConnectError("down")) as m:
@@ -115,8 +115,8 @@ def test_prompt_parity_sync_vs_once():
     # The 1-try and 3-try paths must send IDENTICAL prompts -- otherwise the
     # worker answers would drift from what customers see on the sync path.
     from unittest.mock import patch
-    import app.ai_service as ai_service
-    from app.ai_service import (
+    import app.services.ai_service as ai_service
+    from app.services.ai_service import (
         answer_customer_question,
         answer_customer_question_once,
     )
@@ -139,8 +139,8 @@ def test_prompt_parity_sync_vs_once():
 def test_empty_answer_json_is_content_blocked():
     from types import SimpleNamespace
     from unittest.mock import patch
-    import app.ai_service as ai_service
-    from app.ai_service import answer_customer_question_once
+    import app.services.ai_service as ai_service
+    from app.services.ai_service import answer_customer_question_once
 
     fake = SimpleNamespace(candidates=[SimpleNamespace()],
                            text='{"intent": "timing", "answer": ""}')

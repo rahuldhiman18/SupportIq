@@ -10,7 +10,7 @@ from uuid import UUID
 import pytest
 from sqlalchemy import select
 
-from app.ai_service import (
+from app.services.ai_service import (
     CustomerAnswer,
     AIRateLimitError,
     AITimeoutError,
@@ -192,7 +192,9 @@ def test_situation_none_when_no_details_given(client):
         )
 
     assert response.status_code == 202
-    assert mock_ai.call_args.kwargs["situation"] is None
+    # prompt_context always adds the not-logged-in hint for anonymous
+    # order-topic questions (asks for order number, never invents facts).
+    assert "NOT LOGGED IN" in mock_ai.call_args.kwargs["situation"]
 
 
 # --- error mapping: typed AI errors -> proper HTTP statuses (all free) ------
@@ -624,7 +626,9 @@ def test_order_facts_never_leak_to_another_customer(client):
             "order_number": "ORD-9003",
         })
     assert response.status_code == 202
-    assert mock_ai.call_args.kwargs["situation"] is None  # no facts loaded
+    # Server refuses to load another customer's order (no leak); it records
+    # a NOT FOUND note so the AI asks for verification instead of inventing.
+    assert "NOT FOUND" in mock_ai.call_args.kwargs["situation"]
 
 
 def test_duplicate_order_returns_409_not_500(client):
@@ -635,7 +639,7 @@ def test_duplicate_order_returns_409_not_500(client):
 
 
 def test_live_facts_instruction_outranks_policy_boilerplate():
-    from app.ai_service import _INTENT_PROMPT
+    from app.services.ai_service import _INTENT_PROMPT
     assert "those facts\nare the answer's core" in _INTENT_PROMPT
     assert "quote the order number, stage, location, ETA" in _INTENT_PROMPT
 
@@ -838,7 +842,7 @@ def test_inline_resolve_returns_status_resolved(client):
 
 def test_queue_email_is_idempotent(db_session):
     """Same idempotency_key never produces two outbox rows."""
-    from app.mail import queue_email
+    from app.services.mail import queue_email
     row1 = queue_email(
         db_session,
         to="a@b.com",
@@ -860,13 +864,13 @@ def test_queue_email_is_idempotent(db_session):
 
 def test_process_outbox_delivers_queued_email(db_session, monkeypatch):
     """process_outbox delivers queued rows and marks them sent."""
-    from app.mail import queue_email, process_outbox, _send_smtp
+    from app.services.mail import queue_email, process_outbox, _send_smtp
     sent = []
 
     def fake_send(to, subject, body_text):
         sent.append((to, subject, body_text))
 
-    monkeypatch.setattr("app.mail._send_smtp", fake_send)
+    monkeypatch.setattr("app.services.mail._send_smtp", fake_send)
 
     row = queue_email(
         db_session,
@@ -889,12 +893,12 @@ def test_process_outbox_delivers_queued_email(db_session, monkeypatch):
 
 def test_process_outbox_marks_failed_on_smtp_error(db_session, monkeypatch):
     """process_outbox records failure, increments attempts, keeps going."""
-    from app.mail import queue_email, process_outbox, _send_smtp
+    from app.services.mail import queue_email, process_outbox, _send_smtp
 
     def boom(to, subject, body_text):
         raise ConnectionError("mail server down")
 
-    monkeypatch.setattr("app.mail._send_smtp", boom)
+    monkeypatch.setattr("app.services.mail._send_smtp", boom)
 
     row = queue_email(
         db_session,
