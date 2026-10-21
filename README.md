@@ -93,6 +93,9 @@ sequenceDiagram
         W->>DB: UPDATE status=resolved
         W->>M: queue_email (idempotent)
         M->>C: Delivery email
+    end
+
+```
 
 ## Folder Structure
 
