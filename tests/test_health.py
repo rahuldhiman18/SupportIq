@@ -1,9 +1,8 @@
 """Health + queue observability: /healthz (open LB probe) + /admin/queue-stats.
 
 Proves the approved design:
-- /healthz is OPEN (no admin key), 200 with {status, db, worker}
-- inline mode reports worker=disabled (no thread expected, not a failure)
-- DB down -> 503 (LB routes away)
+- /healthz is OPEN (no admin key), 200 with {status} only -- no internal
+  component details exposed
 - /admin/queue-stats needs the admin key (401 without), returns counts +
   ages as FACTS (monitor owns thresholds, app only hints 120/600)
 - heartbeat: fresh loop beat -> running/idle, stale beat -> stale
@@ -21,8 +20,8 @@ def test_healthz_open_inline_reports_disabled(client):
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "ok"
-    assert body["db"] == "up"
-    assert body["worker"] == "disabled"  # inline mode: no thread expected
+    # No internal component details exposed on the open probe.
+    assert set(body.keys()) == {"status"}
 
 
 def test_healthz_needs_no_admin_key(client):

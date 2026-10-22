@@ -59,12 +59,19 @@ def _worker_state() -> tuple[str, float | None, float | None]:
 
 @router.get("/healthz")
 def healthz(db: Session = Depends(get_db)):
+    """LB probe: open, no auth. Returns only status -- no internal details.
+
+    On success: {"status": "ok"}  (200)
+    On failure: {"status": "degraded"}  (503)
+
+    Component-level detail (db up/down, worker state) lives in
+    /admin/queue-stats which requires ADMIN_API_KEY.
+    """
     try:
         db.execute(select(1)).fetchall()
     except SQLAlchemyError:
-        raise HTTPException(status_code=503, detail="database unreachable")
-    state, _, _ = _worker_state()
-    return {"status": "ok", "db": "up", "worker": state}
+        raise HTTPException(status_code=503, detail="degraded")
+    return {"status": "ok"}
 
 
 @router.get("/admin/queue-stats")
