@@ -15,7 +15,8 @@ import app.main as main
 from app.services import worker as _worker
 
 
-def test_healthz_open_inline_reports_disabled(client):
+def test_healthz_open_inline_reports_disabled(client, monkeypatch):
+    monkeypatch.setattr("app.core.health.check_gemini", lambda: True)
     r = client.get("/healthz")
     assert r.status_code == 200
     body = r.json()
@@ -24,8 +25,9 @@ def test_healthz_open_inline_reports_disabled(client):
     assert set(body.keys()) == {"status"}
 
 
-def test_healthz_needs_no_admin_key(client):
+def test_healthz_needs_no_admin_key(client, monkeypatch):
     # Explicit: no header at all, still 200 (LBs carry no credentials).
+    monkeypatch.setattr("app.core.health.check_gemini", lambda: True)
     r = client.get("/healthz", headers={})
     assert r.status_code == 200
 
@@ -52,7 +54,8 @@ def test_queue_stats_requires_admin_key(client):
     assert r.status_code == 401
 
 
-def test_queue_stats_counts_and_ages(client, db_session):
+def test_queue_stats_counts_and_ages(client, db_session, monkeypatch):
+    monkeypatch.setattr("app.core.health.check_gemini", lambda: True)
     from tests.test_queries import ADMIN_HEADERS
     from app.models import SupportQuery
 

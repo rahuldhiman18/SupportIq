@@ -23,9 +23,9 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.health import check_health
 from app.services import worker as _worker
 from app.core.deps import _query_mode, get_db
 from app.models.tables import SupportQuery
@@ -59,17 +59,16 @@ def _worker_state() -> tuple[str, float | None, float | None]:
 
 @router.get("/healthz")
 def healthz(db: Session = Depends(get_db)):
-    """LB probe: open, no auth. Returns only status -- no internal details.
+    """LB probe: open, no auth. Minimal status only.
 
     On success: {"status": "ok"}  (200)
     On failure: {"status": "degraded"}  (503)
 
-    Component-level detail (db up/down, worker state) lives in
-    /admin/queue-stats which requires ADMIN_API_KEY.
+    Component-level detail (db up/down, gemini up/down, worker state) lives
+    in /admin/queue-stats which requires ADMIN_API_KEY.
     """
-    try:
-        db.execute(select(1)).fetchall()
-    except SQLAlchemyError:
+    components = check_health(db)
+    if not all(components.values()):
         raise HTTPException(status_code=503, detail="degraded")
     return {"status": "ok"}
 
@@ -100,11 +99,13 @@ def queue_stats(db: Session = Depends(get_db),
         return max(0.0, (datetime.now(timezone.utc) - ts_utc).total_seconds())
 
     _, loop_age, claim_age = _worker_state()
+    components = check_health(db)
     return {
         "counts": counts,
         "oldest_queued_age_s": _age_s(oldest_queued),
         "oldest_processing_age_s": _age_s(oldest_processing),
         "needs_human": counts.get("needs_human", 0),
+        "components": components,
         "worker": _worker_state()[0],
         "worker_loop_age_s": loop_age,
         "worker_claim_age_s": claim_age,
