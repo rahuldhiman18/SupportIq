@@ -20,6 +20,8 @@ from app.api.v1 import knowledge as routes_knowledge
 from app.api.v1 import orders as routes_orders
 from app.api.v1 import queries as routes_queries
 from app.core.deps import _query_mode, _rate_hits, get_db  # noqa: F401 (re-exported for tests)
+from app.core.logging import setup_logging
+from app.core.middleware import CorrelationMiddleware, LoggingMiddleware
 from app.services.prompt_context import build_prompt_context, _extract_order_number  # noqa: F401
 from app.core.security import (  # noqa: F401 (re-exported for tests/scripts)
     _ACCESS_TOKEN_MINUTES,
@@ -45,7 +47,16 @@ from app.core.security import (  # noqa: F401 (re-exported for tests/scripts)
 # time via `import app.main` (no cycle: lookup happens inside the request).
 from app.api.v1.queries import answer_customer_question  # noqa: F401
 
+# Configure structured JSON logging before anything else logs.
+setup_logging()
+
 app = FastAPI(title="SupportIq")
+
+# Correlation + security headers middleware (outermost: runs first on request,
+# last on response -- sets context vars before LoggingMiddleware captures them).
+app.add_middleware(LoggingMiddleware)
+# Access logging middleware (captures correlation context after it's set).
+app.add_middleware(CorrelationMiddleware)
 
 app.include_router(routes_auth.router)
 app.include_router(routes_health.router)

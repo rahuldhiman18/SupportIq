@@ -15,15 +15,16 @@ AI-powered customer-support query engine with exactly-once queue processing, JWT
 5. [Scale — Endpoints, Tables, Migrations](#scale)
 6. [Tests](#tests)
 7. [Speed & Performance](#speed)
-8. [RAG & Knowledge Base](#rag)
-9. [AI Tool Calling & Human Handoff](#tool-calling)
-10. [Redis & Caching](#redis)
-11. [Gemini Integration](#gemini)
-12. [Getting Started](#getting-started)
-13. [API Reference](#api-reference)
-14. [Environment Variables](#environment-variables)
-15. [Deployment & Status](#deployment-status)
-16. [License](#license)
+8. [Observability & Security](#observability-security)
+9. [RAG & Knowledge Base](#rag)
+10. [AI Tool Calling & Human Handoff](#tool-calling)
+11. [Redis & Caching](#redis)
+12. [Gemini Integration](#gemini)
+13. [Getting Started](#getting-started)
+14. [API Reference](#api-reference)
+15. [Environment Variables](#environment-variables)
+16. [Deployment & Status](#deployment-status)
+17. [License](#license)
 
 ## Overview
 
@@ -37,6 +38,11 @@ SupportIq is a FastAPI backend that lets customers submit support questions, get
 | Inline vs Queued mode | Flip QUERY_MODE env var without code change |
 | Stdlib-only auth | HS256 JWT + PBKDF2 passwords, no extra dependencies |
 | SQL-based grounding (no vector DB yet) | Keeps Phase A dependency-free; pgvector is Phase B |
+| Structured JSON logging + correlation IDs | Every log line is one JSON object with request_id, endpoint, latency_ms; X-Request-ID propagated via contextvars |
+| Security headers on all responses | X-Content-Type-Options, X-Frame-Options, X-XSS-Protection, HSTS, CSP |
+| Deep health checks | /healthz checks DB + Gemini (count_tokens, cached 30s) |
+| DB connection pool tuning | pool_size=20, max_overflow=40, pool_pre_ping=True |
+| Request timeout middleware | 30s timeout on route handlers, 504 on timeout |
 
 ## Roadmap — Now vs Later
 
@@ -151,7 +157,8 @@ supportiq/
 | Metric | Value |
 |--------|-------|
 | Test files | 9 (`conftest.py` + 8 test modules) |
-| Passing | 100% |
+| Tests | 111 |
+| Passing | 100% (111/111) |
 | Runner | `pytest` |
 
 ## Speed & Performance
@@ -165,6 +172,19 @@ supportiq/
 | Rate limit | 30 POST /queries per IP / min | In-memory (stdlib) |
 | DB ping (`/healthz`) | 2s short timeout | — |
 | Worker reaper threshold | 60s stale `processing` | — |
+
+## Observability & Security
+
+| Component | Status | Detail |
+|-----------|--------|--------|
+| Structured logging | JSON lines to stdout | `ts`, `level`, `service`, `version`, `request_id`, `endpoint`, `latency_ms`, `message`, `module` |
+| Correlation ID | `X-Request-ID` header | Propagated via `contextvars` (survives `await`); echoed in response headers |
+| Request latency | `X-Process-Time` header | Measured per request, logged in JSON |
+| Security headers | All responses | `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection`, `Strict-Transport-Security`, `Content-Security-Policy: default-src 'self'` |
+| Secret redaction | Log formatter | `Authorization`, `X-Admin-Key`, `GEMINI_API_KEY`, `JWT_SECRET_KEY`, `ADMIN_API_KEY`, `SMTP_PASSWORD`, `DATABASE_URL` redacted |
+| Health check depth | `/healthz` | DB ping (2s timeout) + Gemini `count_tokens` (cached 30s) |
+| DB connection pool | SQLAlchemy | `pool_size=20`, `max_overflow=40`, `pool_pre_ping=True` |
+| Request timeout | Middleware | 30s per route, returns 504 on timeout |
 
 ## RAG & Knowledge Base
 
