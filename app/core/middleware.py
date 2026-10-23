@@ -1,17 +1,21 @@
-"""FastAPI middleware: correlation IDs, request timing, security headers.
+"""FastAPI middleware: correlation IDs, request timing, security headers, timeouts.
 
 - X-Request-ID generated per request, propagated via contextvars to loggers.
 - X-Request-ID echoed back in response headers.
 - X-Process-Time header added (latency in ms).
 - Security headers added to every response.
+- TimeoutMiddleware wraps call_next with asyncio.wait_for; returns 504 on timeout.
 """
 
+import asyncio
 import logging
+import os
 import time
 import uuid
 from typing import Callable
 
 from fastapi import Request, Response
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.logging import endpoint_var, request_id_var
@@ -23,6 +27,28 @@ SECURITY_HEADERS = {
     "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
     "Content-Security-Policy": "default-src 'self'",
 }
+
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
+
+
+class TimeoutMiddleware(BaseHTTPMiddleware):
+    """Wrap every request with a hard timeout; return 504 on timeout.
+
+    Outermost middleware so it wraps correlation, logging, and route handlers.
+    A cancelled asyncio task may leave DB/Gemini work in flight, but the
+    customer gets a fast 504 instead of a hanging connection.
+    """
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        try:
+            return await asyncio.wait_for(
+                call_next(request), timeout=REQUEST_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                status_code=504,
+                content={"status": "degraded", "error": "request timeout"},
+            )
 
 
 class CorrelationMiddleware(BaseHTTPMiddleware):

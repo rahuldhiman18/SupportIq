@@ -21,7 +21,11 @@ from app.api.v1 import orders as routes_orders
 from app.api.v1 import queries as routes_queries
 from app.core.deps import _query_mode, _rate_hits, get_db  # noqa: F401 (re-exported for tests)
 from app.core.logging import setup_logging
-from app.core.middleware import CorrelationMiddleware, LoggingMiddleware
+from app.core.middleware import (
+    CorrelationMiddleware,
+    LoggingMiddleware,
+    TimeoutMiddleware,
+)
 from app.services.prompt_context import build_prompt_context, _extract_order_number  # noqa: F401
 from app.core.security import (  # noqa: F401 (re-exported for tests/scripts)
     _ACCESS_TOKEN_MINUTES,
@@ -57,6 +61,8 @@ app = FastAPI(title="SupportIq")
 app.add_middleware(LoggingMiddleware)
 # Access logging middleware (captures correlation context after it's set).
 app.add_middleware(CorrelationMiddleware)
+# Timeout middleware: outermost, wraps everything with 30s hard cap -> 504.
+app.add_middleware(TimeoutMiddleware)
 
 app.include_router(routes_auth.router)
 app.include_router(routes_health.router)
