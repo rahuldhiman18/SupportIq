@@ -33,6 +33,7 @@ from app.core.database import SessionLocal
 from app.services.mail import process_outbox, queue_email, resolution_email
 from app.models.tables import AGING_SECONDS_PER_POINT, SupportQuery, Support_Answer
 from app.services.prompt_context import build_prompt_context
+from app.core.cache import CachedAnswer, answer_cache, build_answer_cache_key
 
 logger = logging.getLogger(__name__)
 
@@ -212,12 +213,38 @@ def process_one(db: Session, query: SupportQuery) -> str:
     if ctx.knowledge_version_id is not None:
         query.knowledge_version_id = ctx.knowledge_version_id
 
+    cache_key = build_answer_cache_key(
+        customer_email=query.customer_email,
+        question=query.question,
+        policy_context=ctx.policy_context,
+        situation=ctx.situation,
+    )
+    cached = answer_cache.get(cache_key)
+    lock_token = None
+    if cached is None:
+        lock_token = answer_cache.acquire_lock(cache_key)
+        if lock_token is None:
+            for _ in range(3 if answer_cache.enabled else 1):
+                cached = answer_cache.get(cache_key)
+                if cached is not None:
+                    break
+                if answer_cache.enabled:
+                    time.sleep(0.05)
+
     try:
-        result = answer_customer_question_once(
-            query.question,
-            policy_context=ctx.policy_context,
-            situation=ctx.situation,
-        )
+        if cached is not None:
+            result = cached
+        else:
+            generated = answer_customer_question_once(
+                query.question,
+                policy_context=ctx.policy_context,
+                situation=ctx.situation,
+            )
+            result = CachedAnswer(
+                intent=generated.intent,
+                answer_text=generated.answer_text,
+            )
+            answer_cache.set(cache_key, result)
     except (AIRateLimitError, AITimeoutError,
             AIContentBlockedError, AIProviderError) as exc:
         record_attempt_failure(query, exc)
@@ -233,6 +260,8 @@ def process_one(db: Session, query: SupportQuery) -> str:
         record_attempt_failure(query, exc)
         db.commit()
         return query.status
+    finally:
+        answer_cache.release_lock(cache_key, lock_token)
 
     db.add(Support_Answer(query_id=query.id, answer_text=result.answer_text))
     record_success(query, result.intent)

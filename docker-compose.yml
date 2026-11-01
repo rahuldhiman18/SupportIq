@@ -13,6 +13,10 @@ services:
       DATABASE_URL: postgresql+psycopg://supportiq:supportiq@db:5432/supportiq
       # inline default = Phase A behavior; flip to queued as the 2nd smoke.
       QUERY_MODE: ${QUERY_MODE:-inline}
+      REDIS_URL: redis://redis:6379/0
+      CACHE_KEY_SECRET: ${CACHE_KEY_SECRET:?set CACHE_KEY_SECRET in .env}
+      AI_CACHE_TTL_SECONDS: ${AI_CACHE_TTL_SECONDS:-600}
+      AI_CACHE_LOCK_SECONDS: ${AI_CACHE_LOCK_SECONDS:-15}
       REFRESH_TOKEN_MINUTES: ${REFRESH_TOKEN_MINUTES:-720}
       # Secrets come from the host .env via compose variable substitution
       # below. NEVER hardcode them here, and .env never enters the image.
@@ -28,6 +32,13 @@ services:
         condition: service_healthy
       mailpit:
         condition: service_started
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
     restart: unless-stopped
 
   db:
@@ -57,3 +68,4 @@ services:
 
 volumes:
   pgdata:
+  redisdata:
