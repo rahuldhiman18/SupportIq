@@ -133,6 +133,22 @@ def current_identity(
         return None
     return verify_access_token(credentials.credentials)
 
+
+def require_customer_identity(
+    identity: dict | None = Depends(current_identity),
+) -> dict | None:
+    """Require a JWT for customer data operations in production."""
+    production = os.getenv("APP_ENV", "production").lower() in {
+        "prod", "production"
+    }
+    if production and (not identity or not identity.get("email")):
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return identity
+
 # --- Refresh tokens: opaque + DB (helpers) ----------------------------------
 # Approved design: 30-min testing TTL via REFRESH_TOKEN_MINUTES (prod default
 # 720 = 12h absolute), rotation on every use, reuse of a rotated token kills

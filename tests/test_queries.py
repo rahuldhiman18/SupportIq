@@ -626,9 +626,9 @@ def test_order_facts_never_leak_to_another_customer(client):
             "order_number": "ORD-9003",
         })
     assert response.status_code == 202
-    # Server refuses to load another customer's order (no leak); it records
-    # a NOT FOUND note so the AI asks for verification instead of inventing.
-    assert "NOT FOUND" in mock_ai.call_args.kwargs["situation"]
+    # Server refuses to load another customer's order (no leak); it gives the
+    # AI a generic verification instruction instead of order facts.
+    assert "ORDER DETAILS ARE UNAVAILABLE" in mock_ai.call_args.kwargs["situation"]
 
 
 def test_duplicate_order_returns_409_not_500(client):

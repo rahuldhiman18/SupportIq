@@ -1,4 +1,5 @@
 """Query routes: create / read / status / answers / admin feed / requeue."""
+import os
 import time
 from uuid import UUID, uuid4
 
@@ -22,7 +23,11 @@ from app.schemas.dto import (
     AnswerResponse, FeedbackCreate, FeedbackResponse, HumanAnswerRequest,
     QueryResponse, QueryUpdate, SupportRequest,
 )
-from app.core.security import current_identity, require_admin_key
+from app.core.security import (
+    current_identity,
+    require_admin_key,
+    require_customer_identity,
+)
 
 # Step 4: resolution email + feedback (outbox is idempotent -- safe on retry).
 from app.services.mail import queue_email, resolution_email
@@ -57,6 +62,30 @@ def _queue_resolution_email(db: Session, query: SupportQuery) -> None:
 router = APIRouter(tags=["queries"])
 
 
+def _read_scope(identity: dict | None, email: str | None) -> str:
+    """Return the trusted customer scope for a query read.
+
+    Production never treats a UUID or caller-supplied email as authorization.
+    The legacy email path is available only when explicitly enabled, plus the
+    pytest compatibility path for the existing offline test suite.
+    """
+    if identity and identity.get("email"):
+        return identity["email"]
+    production = os.getenv("APP_ENV", "development").lower() in {
+        "prod", "production"
+    }
+    legacy_enabled = os.getenv("ALLOW_LEGACY_EMAIL_QUERY_ACCESS", "false").lower() == "true"
+    if not production:
+        # Preserve the existing local development behavior.
+        return email or ""
+    if legacy_enabled and email:
+        return email
+    raise HTTPException(
+        status_code=401,
+        detail="Authentication required to read query data",
+    )
+
+
 # Re-exported so existing `from app.main import answer_customer_question`
 # patches keep hitting the live name (tests patch app.main, which re-exports
 # this module attribute -- see app/main.py shims).
@@ -69,7 +98,15 @@ def answer_customer_question(*args, **kwargs):
 def create_query(request: SupportRequest, http_request: Request,
                  db = Depends(get_db),
                  _throttle: None = Depends(throttle_public_chat),
-                 identity: dict | None = Depends(current_identity)):
+                 identity: dict | None = Depends(require_customer_identity)):
+    production = os.getenv("APP_ENV", "production").lower() in {
+        "prod", "production"
+    }
+    if production and (identity or {}).get("email", "").lower() != request.customer_email.lower():
+        raise HTTPException(
+            status_code=403,
+            detail="The request email must match the authenticated account",
+        )
     # Persist the request extras (Step 3b): queued workers rebuild the prompt
     # from these columns after the HTTP request is long gone. Inline mode
     # reads them through the same context builder below, so both paths
@@ -201,11 +238,11 @@ def create_query(request: SupportRequest, http_request: Request,
 
 @router.get("/queries/{query_id}",response_model=QueryResponse)
 def get_query(query_id:UUID, email: str | None = None, db = Depends(get_db),
-              identity: dict | None = Depends(current_identity)):
+              identity: dict | None = Depends(require_customer_identity)):
     # READ-ONLY: select only, no writes, no AI calls -- safe to poll/refresh/cached.
     # Ownership: token email wins; else ?email= must match; else legacy open
     # (keeps existing offline tests passing; Phase C will require auth).
-    effective_email = (identity or {}).get("email") or email
+    effective_email = _read_scope(identity, email)
     stmt = select(SupportQuery).where(SupportQuery.id == query_id)
     if effective_email:
         stmt = stmt.where(SupportQuery.customer_email == effective_email)
@@ -244,10 +281,10 @@ def update_query(query_id:UUID, request:QueryUpdate, db = Depends(get_db),
 @router.get("/queries/{query_id}/answer", response_model=AnswerResponse)
 def get_latest_answer(query_id: UUID, email: str | None = None,
                       db: Session = Depends(get_db),
-                      identity: dict | None = Depends(current_identity)):
+                      identity: dict | None = Depends(require_customer_identity)):
     # READ-ONLY: select only, no writes, no AI calls -- safe to poll/refresh/cached.
     # Ownership scoped like get_query: token wins, else ?email=, else legacy open.
-    effective_email = (identity or {}).get("email") or email
+    effective_email = _read_scope(identity, email)
     owner_stmt = select(SupportQuery.id).where(SupportQuery.id == query_id)
     if effective_email:
         owner_stmt = owner_stmt.where(SupportQuery.customer_email == effective_email)
@@ -305,6 +342,7 @@ def submit_feedback(
     query_id: UUID,
     request: FeedbackCreate,
     db: Session = Depends(get_db),
+    identity: dict | None = Depends(require_customer_identity),
 ):
     """Customer rates a resolved query (1-5) with an optional comment.
 
@@ -315,6 +353,11 @@ def submit_feedback(
         select(SupportQuery).where(SupportQuery.id == query_id)
     ).scalar_one_or_none()
     if query is None:
+        raise HTTPException(status_code=404, detail="Query not found")
+    production = os.getenv("APP_ENV", "production").lower() in {
+        "prod", "production"
+    }
+    if production and (identity or {}).get("email", "").lower() != query.customer_email.lower():
         raise HTTPException(status_code=404, detail="Query not found")
     if query.status != "resolved":
         raise HTTPException(

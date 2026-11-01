@@ -11,6 +11,7 @@ import os
 # Must happen before any `app.*` import (ai_service fails fast on missing key)
 os.environ.setdefault("GEMINI_API_KEY", "dummy-key-for-tests-no-network")
 os.environ.setdefault("DATABASE_URL", "sqlite://")
+os.environ["APP_ENV"] = "development"
 # .env carries a real ADMIN_API_KEY and load_dotenv() runs at app import,
 # leaking it into this process. Tests must own their env deterministically:
 # FORCE the known test key so results never depend on the machine's .env or

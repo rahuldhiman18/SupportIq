@@ -209,6 +209,10 @@ def process_one(db: Session, query: SupportQuery) -> str:
         order_number=query.order_number,
         purchase_date=query.purchase_date,
         order_status=query.order_status,
+        # The POST /queries route verifies this email against the JWT before
+        # persisting the row. The worker has no JWT, so it uses only this
+        # trusted, server-persisted identity for the order lookup.
+        auth_email=query.customer_email,
     )
     if ctx.knowledge_version_id is not None:
         query.knowledge_version_id = ctx.knowledge_version_id

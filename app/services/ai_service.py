@@ -16,6 +16,7 @@ from tenacity import (
     before_log,
     after_log,
 )
+from app.core.privacy import sanitize_for_ai
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -79,7 +80,7 @@ def _generate(question: str, *, json_mode: bool = False) -> types.GenerateConten
     )
     return client.models.generate_content(
         model="gemini-3.5-flash-lite",
-        contents=question,
+        contents=sanitize_for_ai(question) or "",
         config=config,
     )
 
@@ -249,7 +250,7 @@ def _generate_once(question: str, *, json_mode: bool = False) -> types.GenerateC
     )
     return client.models.generate_content(
         model="gemini-3.5-flash-lite",
-        contents=question,
+        contents=sanitize_for_ai(question) or "",
         config=config,
     )
 

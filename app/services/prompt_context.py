@@ -8,6 +8,7 @@ Both serving paths build the EXACT same prompt inputs through this module:
 Extracted verbatim from main.create_query so the two paths can never drift
 apart (same policy join, same first-policy FK choice, same situation math).
 """
+import os
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -91,12 +92,22 @@ def build_prompt_context(
     resolved_order_number = None
     order_ref = order_number or _extract_order_number(question)
     if order_ref:
-        order = db.execute(
-            select(Order).where(
-                Order.order_number == order_ref.strip().upper(),
-                Order.customer_email == customer_email,
-            )
-        ).scalars().first()
+        # A body email is not proof of ownership. Only a JWT-verified email
+        # may cause an order row to be loaded into provider-bound context.
+        order = None
+        production = os.getenv("APP_ENV", "production").lower() in {
+            "prod", "production"
+        }
+        if (not production) or (
+            auth_email and auth_email.lower() == customer_email.lower()
+        ):
+            lookup_email = auth_email if production else customer_email
+            order = db.execute(
+                select(Order).where(
+                    Order.order_number == order_ref.strip().upper(),
+                    Order.customer_email == lookup_email,
+                )
+            ).scalars().first()
         if order:
             situation_parts.append(order.tracking_facts())
             stalled = order.is_stalled()
@@ -104,7 +115,9 @@ def build_prompt_context(
             # Referenced but not found for this email: tell the AI so it can
             # ask them to double-check instead of inventing facts.
             situation_parts.append(
-                f"ORDER {order_ref.strip().upper()} NOT FOUND for this email"
+                "ORDER DETAILS ARE UNAVAILABLE because the customer identity "
+                "was not verified. Ask the customer to sign in before checking "
+                "a specific order."
             )
     elif _ORDER_TOPIC_RE.search(question):
         # Agent-style resolution (approved, single-call design): the server

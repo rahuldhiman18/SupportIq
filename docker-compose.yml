@@ -10,7 +10,8 @@ services:
     ports:
       - "8765:8000"          # host 8765 -> container 8000 (approved)
     environment:
-      DATABASE_URL: postgresql+psycopg://supportiq:supportiq@db:5432/supportiq
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-supportiq}
       # inline default = Phase A behavior; flip to queued as the 2nd smoke.
       QUERY_MODE: ${QUERY_MODE:-inline}
       REDIS_URL: redis://redis:6379/0
@@ -44,11 +45,9 @@ services:
   db:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: supportiq
-      POSTGRES_PASSWORD: supportiq
-      POSTGRES_DB: supportiq
-    ports:
-      - "5433:5432"          # host 5433 avoids clashing with any local Postgres (5432)
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-supportiq}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

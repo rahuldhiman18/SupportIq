@@ -1,4 +1,5 @@
 """Order routes: create + track."""
+import os
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -7,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.core.deps import get_db
 from app.models.tables import Order, OrderEvent
 from app.schemas.dto import OrderCreate, OrderTrackResponse
-from app.core.security import current_identity, require_admin_key
+from app.core.security import current_identity, require_admin_key, require_customer_identity
 
 router = APIRouter(tags=["orders"])
 
@@ -40,10 +41,14 @@ def create_order(request: OrderCreate, db: Session = Depends(get_db),
 @router.get("/orders/{order_number}", response_model=OrderTrackResponse)
 def get_order(order_number: str, email: str | None = None,
               db: Session = Depends(get_db),
-              identity: dict | None = Depends(current_identity)):
-    # Token wins over ?email: a logged-in user can only see their own orders.
-    # Anonymous callers must pass ?email= (existing behavior, still open).
-    effective_email = (identity or {}).get("email") or email
+              identity: dict | None = Depends(require_customer_identity)):
+    # In production, ownership comes only from the verified JWT. The email
+    # query parameter is retained only for local-development compatibility.
+    production = os.getenv("APP_ENV", "production").lower() in {
+        "prod", "production"
+    }
+    effective_email = ((identity or {}).get("email") if production
+                       else (identity or {}).get("email") or email)
     if not effective_email:
         raise HTTPException(status_code=401,
                             detail="Login or pass ?email= to view this order")
