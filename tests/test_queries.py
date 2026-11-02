@@ -867,7 +867,7 @@ def test_process_outbox_delivers_queued_email(db_session, monkeypatch):
     from app.services.mail import queue_email, process_outbox, _send_smtp
     sent = []
 
-    def fake_send(to, subject, body_text):
+    def fake_send(to, subject, body_text, *, idempotency_key=None):
         sent.append((to, subject, body_text))
 
     monkeypatch.setattr("app.services.mail._send_smtp", fake_send)
@@ -895,7 +895,7 @@ def test_process_outbox_marks_failed_on_smtp_error(db_session, monkeypatch):
     """process_outbox records failure, increments attempts, keeps going."""
     from app.services.mail import queue_email, process_outbox, _send_smtp
 
-    def boom(to, subject, body_text):
+    def boom(to, subject, body_text, *, idempotency_key=None):
         raise ConnectionError("mail server down")
 
     monkeypatch.setattr("app.services.mail._send_smtp", boom)

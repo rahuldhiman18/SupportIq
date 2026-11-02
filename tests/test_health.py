@@ -80,7 +80,7 @@ def test_heartbeat_fresh_vs_stale(monkeypatch):
     from app.api.v1 import health as health
 
     monkeypatch.setenv("QUERY_MODE", "queued")
-    now = time.monotonic()
+    now = time.time()
     monkeypatch.setattr(_worker, "_heartbeat",
                         {"last_loop_at": now, "last_claim_at": now})
     state, loop_age, claim_age = health._worker_state()

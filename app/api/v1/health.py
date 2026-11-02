@@ -24,7 +24,9 @@ def _worker_state() -> tuple[str, float | None, float | None]:
     if _query_mode() != "queued":
         return "disabled", None, None
     hb = _worker.get_heartbeat()
-    now = time.monotonic()
+    # Worker timestamps are wall-clock values because the worker and API are
+    # separate processes. Monotonic clocks cannot be compared across them.
+    now = time.time()
     loop_age = None if hb["last_loop_at"] is None else now - hb["last_loop_at"]
     claim_age = None if hb["last_claim_at"] is None else now - hb["last_claim_at"]
     if loop_age is None or loop_age > HEARTBEAT_STALE_SECONDS:

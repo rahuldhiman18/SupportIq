@@ -15,9 +15,15 @@ Statuses written here are plain strings: the PATCH /queries/{id} enum stays
 narrow until that endpoint gets admin auth (it currently has none).
 """
 import logging
+import os
+import socket
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Protocol
+
+from redis import Redis
+from redis.exceptions import RedisError
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -305,6 +311,56 @@ def run_once(db: Session | None = None) -> bool:
 
 POLL_SECONDS = 1.0
 
+
+class WorkerTask(Protocol):
+    """Minimal work contract required by the worker runtime.
+
+    Structural typing keeps the runtime independent from queue details: any
+    task that can perform one unit of work can be substituted in tests or a
+    future queue implementation without modifying the runtime loop.
+    """
+
+    def run_once(self) -> bool:
+        """Process one available item and return whether work was done."""
+
+
+class QueueWorkerTask:
+    """Production adapter from the queue service to the runtime contract."""
+
+    def run_once(self) -> bool:
+        return run_once()
+
+
+class WorkerRuntime:
+    """Own only the lifecycle and polling policy of a worker process."""
+
+    def __init__(
+        self,
+        task: WorkerTask,
+        *,
+        poll_seconds: float = POLL_SECONDS,
+        logger_: logging.Logger | None = None,
+    ) -> None:
+        self._task = task
+        self._poll_seconds = poll_seconds
+        self._logger = logger_ or logger
+
+    def run_forever(self, stop_event: threading.Event) -> None:
+        """Run an injected task until the process receives a stop signal."""
+        self._logger.info(
+            "queue worker started (poll every %.1fs)", self._poll_seconds
+        )
+        while not stop_event.is_set():
+            _beat(loop=True)
+            try:
+                worked = self._task.run_once()
+            except Exception:  # a crashed loop is worse than a slow one
+                self._logger.exception("queue worker iteration failed")
+                worked = False
+            if not worked:
+                stop_event.wait(self._poll_seconds)
+        self._logger.info("queue worker stopped")
+
 # --- Worker heartbeat (health observability) --------------------------------
 # In-memory timestamps (time.monotonic: immune to NTP jumps). Two signals:
 #   last_loop_at  -- worker thread is iterating (alive vs dead)
@@ -317,46 +373,90 @@ POLL_SECONDS = 1.0
 _heartbeat: dict[str, float | None] = {"last_loop_at": None,
                                        "last_claim_at": None}
 _HEARTBEAT_LOCK = threading.Lock()
+_WORKER_ID = os.getenv("WORKER_ID") or socket.gethostname()
+_HEARTBEAT_KEY_PREFIX = "supportiq:worker:heartbeat:"
+_heartbeat_client: Redis | None = None
+
+
+def _redis_heartbeat_client() -> Redis | None:
+    global _heartbeat_client
+    url = os.getenv("REDIS_URL")
+    if not url:
+        return None
+    if _heartbeat_client is None:
+        _heartbeat_client = Redis.from_url(
+            url,
+            decode_responses=True,
+            socket_connect_timeout=0.2,
+            socket_timeout=0.2,
+            health_check_interval=30,
+        )
+    return _heartbeat_client
 
 
 def get_heartbeat() -> dict[str, float | None]:
+    client = _redis_heartbeat_client()
+    if client is not None:
+        try:
+            latest = {"last_loop_at": None, "last_claim_at": None}
+            for key in client.scan_iter(
+                match=f"{_HEARTBEAT_KEY_PREFIX}*"
+            ):
+                values = client.hgetall(key)
+                loop_at = float(values["last_loop_at"]) if values.get("last_loop_at") else None
+                claim_at = float(values["last_claim_at"]) if values.get("last_claim_at") else None
+                if loop_at is not None and (
+                    latest["last_loop_at"] is None or loop_at > latest["last_loop_at"]
+                ):
+                    latest["last_loop_at"] = loop_at
+                if claim_at is not None and (
+                    latest["last_claim_at"] is None or claim_at > latest["last_claim_at"]
+                ):
+                    latest["last_claim_at"] = claim_at
+            if latest["last_loop_at"] is not None:
+                return latest
+        except (RedisError, ValueError, TypeError):
+            pass
     with _HEARTBEAT_LOCK:
         return dict(_heartbeat)
 
 
 def _beat(loop: bool = False, claimed: bool = False) -> None:
-    now = time.monotonic()
+    now = time.time()
     with _HEARTBEAT_LOCK:
         if loop:
             _heartbeat["last_loop_at"] = now
         if claimed:
             _heartbeat["last_claim_at"] = now
+    client = _redis_heartbeat_client()
+    if client is not None:
+        try:
+            fields = {}
+            if loop:
+                fields["last_loop_at"] = str(now)
+            if claimed:
+                fields["last_claim_at"] = str(now)
+            if fields:
+                key = f"{_HEARTBEAT_KEY_PREFIX}{_WORKER_ID}"
+                client.hset(key, mapping=fields)
+                client.expire(key, 30)
+        except RedisError:
+            # Local heartbeat remains available if Redis is temporarily down.
+            pass
 
 
 def run_forever(stop_event: threading.Event,
                 poll_seconds: float = POLL_SECONDS) -> None:
-    """Drain loop for the in-process thread (or `python -m app.worker`).
-
-    One row at a time keeps Gemini concurrency at exactly 1 per worker and
-    lets priority order win between every single claim. An empty queue
-    sleeps; a hot queue loops immediately.
-    """
-    logger.info("queue worker started (poll every %.1fs)", poll_seconds)
-    while not stop_event.is_set():
-        _beat(loop=True)
-        try:
-            worked = run_once()
-        except Exception:  # a crashed loop is worse than a slow one
-            logger.exception("queue worker iteration failed")
-            worked = False
-        if not worked:
-            stop_event.wait(poll_seconds)
-    logger.info("queue worker stopped")
+    """Compatibility adapter for the standalone worker entrypoint."""
+    WorkerRuntime(
+        QueueWorkerTask(),
+        poll_seconds=poll_seconds,
+    ).run_forever(stop_event)
 
 
 if __name__ == "__main__":
-    # Standalone worker (optional -- the API runs one in-process by default):
-    #   QUERY_MODE=queued python -m app.worker
+    # Standalone worker service:
+    #   QUERY_MODE=queued python -m app.services.worker
     import signal
 
     _stop = threading.Event()

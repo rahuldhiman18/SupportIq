@@ -37,8 +37,6 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status==200 else 1)"
 
-# Migrate once, then serve. Inline mode is the compose default (queued flips
-# on as the second smoke). 0.0.0.0 so the port is reachable from outside the
-# container; --workers=1 keeps the single in-process queue worker (matches the
-# heartbeat/throttle design).
-CMD ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"]
+# The image is used by separate migrate, API, and worker services. The
+# deployment layer owns migration ordering and process selection.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

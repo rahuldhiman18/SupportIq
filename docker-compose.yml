@@ -4,36 +4,60 @@
 # 8GB-safe: this file is small on its own; cap WSL2 memory (see .wslconfig) so
 # the Docker VM cannot starve Windows.
 
+x-supportiq-environment: &supportiq-environment
+  APP_ENV: production
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-supportiq}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-supportiq}
+  QUERY_MODE: queued
+  REDIS_URL: redis://redis:6379/0
+  CACHE_KEY_SECRET: ${CACHE_KEY_SECRET:?set CACHE_KEY_SECRET in .env}
+  AI_CACHE_TTL_SECONDS: ${AI_CACHE_TTL_SECONDS:-600}
+  AI_CACHE_LOCK_SECONDS: ${AI_CACHE_LOCK_SECONDS:-15}
+  REFRESH_TOKEN_MINUTES: ${REFRESH_TOKEN_MINUTES:-720}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY in .env}
+  JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY in .env}
+  ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY in .env}
+  SMTP_HOST: mailpit
+  SMTP_PORT: 1025
+
 services:
+  migrate:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-supportiq}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-supportiq}
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    healthcheck:
+      disable: true
+
   api:
     build: .
     ports:
       - "8765:8000"          # host 8765 -> container 8000 (approved)
-    environment:
-      APP_ENV: production
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-supportiq}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-supportiq}
-      # inline default = Phase A behavior; flip to queued as the 2nd smoke.
-      QUERY_MODE: ${QUERY_MODE:-inline}
-      REDIS_URL: redis://redis:6379/0
-      CACHE_KEY_SECRET: ${CACHE_KEY_SECRET:?set CACHE_KEY_SECRET in .env}
-      AI_CACHE_TTL_SECONDS: ${AI_CACHE_TTL_SECONDS:-600}
-      AI_CACHE_LOCK_SECONDS: ${AI_CACHE_LOCK_SECONDS:-15}
-      REFRESH_TOKEN_MINUTES: ${REFRESH_TOKEN_MINUTES:-720}
-      # Secrets come from the host .env via compose variable substitution
-      # below. NEVER hardcode them here, and .env never enters the image.
-      GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY in .env}
-      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY in .env}
-      ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY in .env}
-      # Mailpit SMTP -- local sink, no real mail, zero quota. The outbox/mailer
-      # (upcoming) will point here by default.
-      SMTP_HOST: mailpit
-      SMTP_PORT: 1025
+    environment: *supportiq-environment
     depends_on:
-      db:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       mailpit:
         condition: service_started
     restart: unless-stopped
+
+  worker:
+    build: .
+    environment:
+      <<: *supportiq-environment
+      WORKER_ID: ${WORKER_ID:-supportiq-worker}
+    command: ["python", "-m", "app.services.worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      mailpit:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      disable: true
 
   redis:
     image: redis:7-alpine
@@ -52,7 +76,7 @@ services:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       # Gates the api on a real DB (service_healthy), so alembic never races.
-      test: ["CMD-SHELL", "pg_isready -U supportiq -d supportiq"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-supportiq} -d ${POSTGRES_DB:-supportiq}"]
       interval: 5s
       timeout: 3s
       retries: 12

@@ -3,15 +3,13 @@
 All feature code lives in focused packages; this file only:
   - creates the FastAPI `app`
   - wires the routers (URLs unchanged)
-  - owns the queued-mode worker lifecycle
+  - composes the HTTP application and routers
   - re-exports names existing tests/scripts import from app.main
 
 Dependency direction (no cycles):
   api/v1/* -> core, schemas, models, services
   main      -> api/v1/*, services.worker
 """
-import threading
-
 from fastapi import FastAPI
 
 from app.api.v1 import auth as routes_auth
@@ -71,23 +69,7 @@ app.include_router(routes_queries.router)
 app.include_router(routes_knowledge.router)
 
 
-_worker_stop = threading.Event()
-
-
-@app.on_event("startup")
-def _start_queue_worker() -> None:
-    # In-process worker thread: no new deploy unit. Scaling later stays safe
-    # because the claim is exactly-once (proven live, 6 concurrent claimers).
-    if _query_mode() != "queued":
-        return  # inline mode: the request itself does the AI work
-    from app.services import worker as _worker
-    threading.Thread(
-        target=_worker.run_forever, kwargs={"stop_event": _worker_stop},
-        daemon=True, name="supportiq-queue-worker",
-    ).start()
-
-
-@app.on_event("shutdown")
-def _stop_queue_worker() -> None:
-    _worker_stop.set()
+# Queue execution intentionally does not live in the HTTP composition root.
+# The standalone worker service owns app.services.worker.run_forever. This
+# keeps API lifecycle, queue execution, and deployment scaling independent.
 

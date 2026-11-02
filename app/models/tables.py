@@ -366,9 +366,12 @@ class EmailOutbox(Base):
     to: Mapped[str] = mapped_column(String, nullable=False)
     subject: Mapped[str] = mapped_column(String, nullable=False)
     body_text: Mapped[str] = mapped_column(String, nullable=False)
-    status: Mapped[str] = mapped_column(default="queued", nullable=False)  # queued | sent | failed
+    status: Mapped[str] = mapped_column(default="queued", nullable=False)  # queued | sending | sent | failed
     attempts: Mapped[int] = mapped_column(default=0, nullable=False)
     error: Mapped[str | None] = mapped_column(String, nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True)
+    locked_by: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     sent_at: Mapped[datetime | None] = mapped_column(
