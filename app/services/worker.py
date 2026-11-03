@@ -249,7 +249,8 @@ def process_one(db: Session, query: SupportQuery) -> str:
             graph_result = run_support_graph(
                 query.question,
                 policy_context=ctx.policy_context,
-                situation=ctx.situation,
+                verified_order_facts=ctx.situation,
+                customer_identity_scope="server_scoped_customer",
                 # Inject the one-attempt provider boundary so tests and
                 # future providers do not couple the graph to Gemini.
                 answer_fn=answer_customer_question_once,

@@ -111,6 +111,14 @@ def test_worker_success_resolves_and_answers(db_session, monkeypatch):
     db_session.add(q)
     db_session.commit()
     monkeypatch.setattr(
+        "app.services.worker.build_prompt_context",
+        lambda *args, **kwargs: SimpleNamespace(
+            policy_context="Approved refund policy: returns are accepted within 14 days.",
+            situation=None,
+            knowledge_version_id=None,
+        ),
+    )
+    monkeypatch.setattr(
         "app.services.worker.answer_customer_question_once",
         lambda *a, **k: SimpleNamespace(intent="eligibility",
                                         answer_text="14 days, per policy."),
@@ -184,5 +192,5 @@ def test_run_once_drains_one_claim_then_stops(db_session, monkeypatch):
     )
     assert run_once(db=db_session) is True
     db_session.refresh(q)
-    assert q.status == "resolved"
+    assert q.status == "needs_human"
     assert run_once(db=db_session) is False  # queue empty now

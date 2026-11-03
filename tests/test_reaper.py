@@ -59,8 +59,18 @@ def test_success_path_unaffected_by_seatbelt(db_session, monkeypatch):
     db_session.add(q)
     db_session.commit()
     monkeypatch.setattr(
+        "app.services.worker.build_prompt_context",
+        lambda *args, **kwargs: SimpleNamespace(
+            policy_context="Approved timing policy: delivery takes 3 to 5 days.",
+            situation=None,
+            knowledge_version_id=None,
+        ),
+    )
+    monkeypatch.setattr(
         "app.services.worker.answer_customer_question_once",
-        lambda *a, **k: SimpleNamespace(intent="timing", answer_text="fine"),
+        lambda *a, **k: SimpleNamespace(
+            intent="timing", answer_text="Delivery takes 3 to 5 days."
+        ),
     )
     assert process_one(db_session, q) == "resolved"
     db_session.refresh(q)
