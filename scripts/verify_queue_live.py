@@ -369,6 +369,12 @@ try:
 finally:
     s.close()
 
+_orig_context = worker.build_prompt_context
+worker.build_prompt_context = lambda *a, **k: SimpleNamespace(
+    policy_context="Approved test policy: verified by fake AI.",
+    situation=None,
+    knowledge_version_id=None,
+)
 worker.answer_customer_question_once = (
     lambda *a, **k: SimpleNamespace(intent="eligibility",
                                     answer_text="verified by fake AI"))
@@ -387,6 +393,7 @@ try:
         s.close()
 finally:
     worker.answer_customer_question_once = _orig_once
+    worker.build_prompt_context = _orig_context
 
 # 5) P0 reaper: stale `processing` rows reclaimed inside claim_next
 wipe_worker_rows()

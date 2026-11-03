@@ -1,6 +1,5 @@
 """Query routes: create / read / status / answers / admin feed / requeue."""
 import os
-import time
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -15,7 +14,8 @@ from app.services.ai_service import (
     AIContentBlockedError,
 )
 from app.core.deps import _query_mode, get_db, throttle_public_chat
-from app.core.cache import CachedAnswer, answer_cache, build_answer_cache_key
+from app.application.services import AnswerGenerationService
+from app.core.cache import answer_cache, build_answer_cache_key
 from app.models.tables import Feedback, SupportQuery, Support_Answer, compute_base_priority
 # Prompt-context builder shared by the inline and queued paths (Step 3b).
 from app.services.prompt_context import build_prompt_context
@@ -170,48 +170,24 @@ def create_query(request: SupportRequest, http_request: Request,
     # NOTE (split task): resolve via app.main at CALL time so existing
     # `patch("app.main.answer_customer_question")` tests keep working --
     # patching app.main replaces the attribute this lookup reads.
-    cache_key = build_answer_cache_key(
-        customer_email=request.customer_email,
-        question=request.question,
-        policy_context=ctx.policy_context,
-        situation=ctx.situation,
-    )
-    cached = answer_cache.get(cache_key)
-    lock_token = None
-    if cached is None:
-        lock_token = answer_cache.acquire_lock(cache_key)
-        if lock_token is None:
-            for _ in range(3 if answer_cache.enabled else 1):
-                cached = answer_cache.get(cache_key)
-                if cached is not None:
-                    break
-                if answer_cache.enabled:
-                    time.sleep(0.05)
-
+    import app.main as _main_module
     try:
-        if cached is not None:
-            result = cached
-        else:
-            import app.main as _main_module
-            try:
-                generated = _main_module.answer_customer_question(
-                    query.question,
-                    policy_context=ctx.policy_context,
-                    situation=ctx.situation,
-                )
-            except AIRateLimitError:
-                raise HTTPException(status_code=429, detail="AI is busy, please try again shortly")
-            except AITimeoutError:
-                raise HTTPException(status_code=504, detail="AI timed out, please try again")
-            except (AIContentBlockedError, AIProviderError):
-                raise HTTPException(status_code=502, detail="Could not generate an answer right now")
-            result = CachedAnswer(
-                intent=generated.intent,
-                answer_text=generated.answer_text,
-            )
-            answer_cache.set(cache_key, result)
-    finally:
-        answer_cache.release_lock(cache_key, lock_token)
+        result = AnswerGenerationService(
+            answerer=_main_module.answer_customer_question,
+            cache=answer_cache,
+            key_factory=build_answer_cache_key,
+        ).generate(
+            query.question,
+            customer_email=query.customer_email,
+            policy_context=ctx.policy_context,
+            situation=ctx.situation,
+        )
+    except AIRateLimitError:
+        raise HTTPException(status_code=429, detail="AI is busy, please try again shortly")
+    except AITimeoutError:
+        raise HTTPException(status_code=504, detail="AI timed out, please try again")
+    except (AIContentBlockedError, AIProviderError):
+        raise HTTPException(status_code=502, detail="Could not generate an answer right now")
 
     generate_text = result.answer_text
     query.intent = result.intent

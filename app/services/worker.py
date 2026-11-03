@@ -40,7 +40,8 @@ from app.core.database import SessionLocal
 from app.services.mail import process_outbox, queue_email, resolution_email
 from app.models.tables import AGING_SECONDS_PER_POINT, SupportQuery, Support_Answer
 from app.services.prompt_context import build_prompt_context
-from app.core.cache import CachedAnswer, answer_cache, build_answer_cache_key
+from app.application.services import AnswerGenerationService
+from app.core.cache import answer_cache, build_answer_cache_key
 
 logger = logging.getLogger(__name__)
 
@@ -224,47 +225,17 @@ def process_one(db: Session, query: SupportQuery) -> str:
     if ctx.knowledge_version_id is not None:
         query.knowledge_version_id = ctx.knowledge_version_id
 
-    cache_key = build_answer_cache_key(
-        customer_email=query.customer_email,
-        question=query.question,
-        policy_context=ctx.policy_context,
-        situation=ctx.situation,
-    )
-    cached = answer_cache.get(cache_key)
-    lock_token = None
-    if cached is None:
-        lock_token = answer_cache.acquire_lock(cache_key)
-        if lock_token is None:
-            for _ in range(3 if answer_cache.enabled else 1):
-                cached = answer_cache.get(cache_key)
-                if cached is not None:
-                    break
-                if answer_cache.enabled:
-                    time.sleep(0.05)
-
     try:
-        if cached is not None:
-            result = cached
-        else:
-            graph_result = run_support_graph(
-                query.question,
-                policy_context=ctx.policy_context,
-                verified_order_facts=ctx.situation,
-                customer_identity_scope="server_scoped_customer",
-                # Inject the one-attempt provider boundary so tests and
-                # future providers do not couple the graph to Gemini.
-                answer_fn=answer_customer_question_once,
-            )
-            if graph_result.outcome != "resolved" or not graph_result.answer_text:
-                raise AIContentBlockedError(
-                    graph_result.validation_error
-                    or "graph routed query to human support"
-                )
-            result = CachedAnswer(
-                intent=graph_result.intent,
-                answer_text=graph_result.answer_text,
-            )
-            answer_cache.set(cache_key, result)
+        result = AnswerGenerationService(
+            answerer=_graph_answer,
+            cache=answer_cache,
+            key_factory=build_answer_cache_key,
+        ).generate(
+            query.question,
+            customer_email=query.customer_email,
+            policy_context=ctx.policy_context,
+            situation=ctx.situation,
+        )
     except (AIRateLimitError, AITimeoutError,
             AIContentBlockedError, AIProviderError) as exc:
         record_attempt_failure(query, exc)
@@ -280,9 +251,6 @@ def process_one(db: Session, query: SupportQuery) -> str:
         record_attempt_failure(query, exc)
         db.commit()
         return query.status
-    finally:
-        answer_cache.release_lock(cache_key, lock_token)
-
     db.add(Support_Answer(query_id=query.id, answer_text=result.answer_text))
     record_success(query, result.intent)
     db.commit()
@@ -290,6 +258,31 @@ def process_one(db: Session, query: SupportQuery) -> str:
     # Queue the resolution email (idempotent: safe on retries).
     _queue_resolution_email(db, query, result.answer_text)
     return query.status
+
+
+def _graph_answer(
+    question: str,
+    *,
+    policy_context: str | None = None,
+    situation: str | None = None,
+):
+    """Adapt the graph result to the application AI-answer contract."""
+    graph_result = run_support_graph(
+        question,
+        policy_context=policy_context,
+        verified_order_facts=situation,
+        customer_identity_scope="server_scoped_customer",
+        answer_fn=answer_customer_question_once,
+    )
+    if graph_result.outcome != "resolved" or not graph_result.answer_text:
+        raise AIContentBlockedError(
+            graph_result.validation_error or "graph routed query to human support"
+        )
+    from app.services.ai_service import CustomerAnswer
+    return CustomerAnswer(
+        intent=graph_result.intent,
+        answer_text=graph_result.answer_text,
+    )
 
 
 def run_once(db: Session | None = None) -> bool:
