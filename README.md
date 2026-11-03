@@ -1,398 +1,380 @@
-﻿# SupportIq
+# SupportIq
 
-AI-powered customer-support query engine with exactly-once queue processing, JWT refresh-token rotation, idempotent email outbox, and hybrid inline/queued AI answering backed by Google Gemini.
+SupportIq is an AI-powered customer-support backend built with FastAPI, PostgreSQL, Redis, and Google Gemini. It grounds answers in approved knowledge and verified order facts, supports inline and queued processing, and escalates unsafe or unresolved answers to human support.
 
-> **Status:** Local development ready — Docker Compose stack (api + Postgres + Mailpit) runs locally. Not yet deployed to AWS.
-> **Team:** Solo build (full stack: API, DB models, queue worker, auth, tests).
-> **Docs:** This README.
+> **Current status:** staging-ready local deployment. The Docker Compose stack is operational, but production still needs a real email provider, HTTPS/load balancing, worker health monitoring, backups, and observability.
 
-## Table of Contents
+## Contents
 
-1. [Overview](#overview)
-2. [Roadmap — Now vs Later](#roadmap)
-3. [System Architecture](#system-architecture)
-4. [Folder Structure](#folder-structure)
-5. [Scale — Endpoints, Tables, Migrations](#scale)
-6. [Tests](#tests)
-7. [Speed & Performance](#speed)
-8. [Observability & Security](#observability-security)
-9. [RAG & Knowledge Base](#rag)
-10. [AI Tool Calling & Human Handoff](#tool-calling)
-11. [Redis & Caching](#redis)
-12. [Gemini Integration](#gemini)
-13. [Getting Started](#getting-started)
-14. [API Reference](#api-reference)
-15. [Environment Variables](#environment-variables)
-16. [Deployment & Status](#deployment-status)
-17. [License](#license)
+1. [Capabilities](#capabilities)
+2. [Architecture](#architecture)
+3. [Application layer and abstractions](#application-layer-and-abstractions)
+4. [Folder structure](#folder-structure)
+5. [Query lifecycle](#query-lifecycle)
+6. [Queue and retry behavior](#queue-and-retry-behavior)
+7. [Email delivery](#email-delivery)
+8. [Redis, caching, and rate limiting](#redis-caching-and-rate-limiting)
+9. [Authentication and security](#authentication-and-security)
+10. [API reference](#api-reference)
+11. [Configuration](#configuration)
+12. [Running locally](#running-locally)
+13. [Testing](#testing)
+14. [Deployment status and remaining work](#deployment-status-and-remaining-work)
 
-## Overview
+## Capabilities
 
-SupportIq is a FastAPI backend that lets customers submit support questions, gets AI-generated answers grounded in your knowledge base and live order data, and falls back to a human queue when the AI can't resolve an issue. Key design decisions:
+- FastAPI HTTP API with Pydantic request/response validation.
+- Inline AI answering or durable PostgreSQL-backed queued answering.
+- Dedicated worker service with `FOR UPDATE SKIP LOCKED` queue claims.
+- AI answer validation, grounding checks, retry backoff, and human handoff.
+- Google Gemini integration with typed provider errors, timeout limits, and retry handling.
+- Redis-backed response caching and stampede-prevention locks.
+- Redis-backed sliding-window rate limiting with fail-closed behavior when Redis is configured but unavailable.
+- JWT access tokens and opaque, hashed, rotating refresh tokens.
+- Admin-key protection for operational and write endpoints.
+- Idempotent email outbox with database leases, retry recovery, and deterministic `Message-ID` values.
+- PostgreSQL migrations managed by Alembic in a separate migration container.
+- Structured JSON logging, correlation IDs, security headers, and request timeouts.
+- LangGraph-based bounded AI workflow with no database or email side effects inside the graph.
 
-| Decision | Rationale |
-|----------|-----------|
-| Exactly-once queue (FOR UPDATE SKIP LOCKED) | Prevents duplicate AI calls and double billing on Gemini |
-| Idempotent email outbox | Same idempotency key never produces two emails |
-| JWT refresh-token rotation | Strict family-kill on reuse (theft detection) |
-| Inline vs Queued mode | Flip QUERY_MODE env var without code change |
-| Stdlib-only auth | HS256 JWT + PBKDF2 passwords, no extra dependencies |
-| SQL-based grounding (no vector DB yet) | Keeps Phase A dependency-free; pgvector is Phase B |
-| Structured JSON logging + correlation IDs | Every log line is one JSON object with request_id, endpoint, latency_ms; X-Request-ID propagated via contextvars |
-| Security headers on all responses | X-Content-Type-Options, X-Frame-Options, X-XSS-Protection, HSTS, CSP |
-| Deep health checks | /healthz checks DB + Gemini (count_tokens, cached 30s) |
-| DB connection pool tuning | pool_size=20, max_overflow=40, pool_pre_ping=True |
-| Request timeout middleware | 30s timeout on route handlers, 504 on timeout |
-
-## Roadmap — Now vs Later
-
-| Area | Now (this release) | Later (planned) |
-|------|-------------------|-----------------|
-| Query serving | inline (AI inside HTTP request, default) | queued production smoke test |
-| Rate limiting | In-memory stdlib (30 req / IP / min) | Redis-backed distributed limiter |
-| Caching | None | Redis query/response cache |
-| RAG | SQL-based policy + live order facts | Embeddings + vector search (pgvector) |
-| AI accuracy | Manual review + pytest suite | Automated RAG eval benchmark |
-| Deployment | Docker Compose (local) | AWS ECS / Fargate + CI/CD |
-| Auth | JWT access + refresh (stdlib HS256) | httpOnly cookies + CSRF (frontend work) |
-| Email | Mailpit / SMTP outbox (idempotent) | Real SMTP credentials + delivery metrics |
-| Knowledge versions | Draft → current (single FK per query) | Approval flow + multi-version publishing |
-
-## System Architecture
+## Architecture
 
 ```mermaid
 graph TD
-    Client[Customer / Dashboard] -->|HTTP| API[FastAPI App]
-    API --> Auth[Auth Layer<br/>Admin key + JWT]
-    API --> Q[Query Router]
-    Q -->|inline mode| AI[Gemini AI Service]
-    Q -->|queued mode| Queue[(support_queries table)]
-    Queue --> Worker[Queue Worker<br/>run_forever loop]
-    Worker --> AI
-    Worker --> Mail[Email Outbox<br/>process_outbox]
-    AI --> KB[Knowledge Base<br/>SQL-based]
-    AI --> Orders[Orders Table<br/>live facts]
-    Mail --> SMTP[SMTP / Mailpit]
-    DB[(PostgreSQL)]:::db
-
-    classDef db fill:#f9f,stroke:#333,stroke-width:2px;
+    Client[Frontend / Customer] -->|HTTPS / HTTP| Proxy[Reverse Proxy or Load Balancer]
+    Proxy --> API[FastAPI API]
+    API --> Auth[Auth and authorization]
+    API --> App[Application services]
+    App --> Context[Prompt context service]
+    Context --> DB[(PostgreSQL)]
+    App --> Cache[Answer cache port]
+    Cache --> Redis[(Redis)]
+    App --> AI[AI provider port]
+    AI --> Gemini[Google Gemini]
+    API --> Queue[(support_queries)]
+    Queue --> Worker[Dedicated worker service]
+    Worker --> Graph[Bounded answer graph]
+    Graph --> AI
+    Worker --> Outbox[(email_outbox)]
+    Outbox --> SMTP[SMTP provider / Mailpit]
+    Migrate[Migration service] -->|alembic upgrade head| DB
 ```
 
-**Request flow (queued mode):**
+The API process does not run the worker loop. Docker Compose starts the migration service first, then starts the API and worker services against the same PostgreSQL database.
+
+### HTTP request composition
+
+```mermaid
+flowchart LR
+    R[HTTP request] --> MW[Timeout + correlation + logging middleware]
+    MW --> Route[API router]
+    Route --> Dep[Dependencies: DB, identity, rate limit]
+    Dep --> UseCase[Application service]
+    UseCase --> Ports[Typed ports]
+    Ports --> Infra[Redis / Gemini / SMTP / PostgreSQL adapters]
+    Infra --> Response[Public DTO response]
+```
+
+## Application layer and abstractions
+
+The application layer hides infrastructure details from routes and workers.
+
+| Component | Responsibility |
+|---|---|
+| `AIAnswerer` port | Defines the provider contract without coupling workflows to Gemini. |
+| `AnswerCachePort` | Defines cache and locking behavior without exposing Redis operations. |
+| `AnswerGenerationService` | Owns cache keys, cache reads/writes, stampede locks, and answer generation. |
+| `WorkerTask` protocol | Allows the worker runtime to run replaceable task implementations. |
+| `run_support_graph` | Encapsulates generate → plan → validate → resolve/handoff behavior. |
+| DTO schemas | Keep public API contracts separate from SQLAlchemy models. |
+
+The inline query route and background worker use the same [AnswerGenerationService](app/application/services.py). This avoids duplicated cache/provider logic and makes fake providers and caches easy to use in tests.
+
+## Folder structure
+
+```text
+supportiq/
+├── alembic/
+│   ├── env.py
+│   └── versions/                    # Database migrations
+├── app/
+│   ├── main.py                      # FastAPI composition root
+│   ├── api/v1/                      # HTTP routers and public endpoints
+│   │   ├── auth.py
+│   │   ├── health.py
+│   │   ├── knowledge.py
+│   │   ├── orders.py
+│   │   └── queries.py
+│   ├── application/                 # Use cases and stable ports
+│   │   ├── ports.py
+│   │   └── services.py
+│   ├── core/                        # Database, security, cache, middleware
+│   │   ├── cache.py
+│   │   ├── database.py
+│   │   ├── deps.py
+│   │   ├── health.py
+│   │   ├── logging.py
+│   │   ├── middleware.py
+│   │   └── security.py
+│   ├── models/tables.py             # SQLAlchemy persistence model
+│   ├── schemas/dto.py               # Pydantic API contracts
+│   └── services/
+│       ├── agent_graph.py           # Bounded AI workflow
+│       ├── ai_service.py            # Gemini adapter and typed errors
+│       ├── mail.py                  # Durable email outbox and SMTP adapter
+│       ├── prompt_context.py        # Knowledge and order grounding
+│       └── worker.py                # Queue claim, retry, reaper, runtime
+├── tests/                           # Offline unit and integration tests
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+└── README.md
+```
+
+## Query lifecycle
 
 ```mermaid
 sequenceDiagram
-    participant C as Customer
-    participant API as FastAPI
-    participant DB as PostgreSQL
+    participant F as Frontend
+    participant A as FastAPI
+    participant D as PostgreSQL
     participant W as Worker
     participant G as Gemini
-    participant M as Mailpit/SMTP
+    participant E as Email outbox
 
-    C->>API: POST /queries (202 Accepted)
-    API->>DB: INSERT support_queries (status=queued)
-    API-->>C: query_id returned
-    loop Poll every 1s
-        W->>DB: CLAIM row FOR UPDATE SKIP LOCKED
-        W->>G: answer_customer_question_once
-        G-->>W: answer text
-        W->>DB: UPDATE status=resolved
-        W->>M: queue_email (idempotent)
-        M->>C: Delivery email
+    F->>A: POST /queries
+    A->>D: Persist support query
+    alt QUERY_MODE=inline
+        A->>G: Generate grounded answer
+        G-->>A: Typed answer
+        A->>D: Persist answer + resolved status
+        A->>E: Queue resolution email idempotently
+        A-->>F: 202 + resolved result
+    else QUERY_MODE=queued
+        A->>D: Set status=queued
+        A-->>F: 202 + query_id
+        loop Poll status
+            W->>D: Claim one row with SKIP LOCKED
+            W->>G: One provider attempt
+            G-->>W: Answer or typed failure
+            W->>D: Persist resolved/retry/needs_human state
+            W->>E: Queue resolution email idempotently
+            F->>A: GET /queries/{id}
+            A-->>F: Current status
+        end
+        F->>A: GET /queries/{id}/answer
     end
-
 ```
 
-## Folder Structure
-
-```
-supportiq/
-├── alembic/
-│   └── env.py                      # Alembic migration environment
-├── app/
-│   ├── main.py                     # Thin shell: FastAPI app, routers, worker lifecycle
-│   ├── core/
-│   │   ├── __init__.py
-│   │   ├── database.py             # SQLAlchemy engine, SessionLocal, Base
-│   │   ├── deps.py                 # get_db, throttle, QUERY_MODE flag
-│   │   └── security.py             # Admin key, JWT, PBKDF2, refresh rotation
-│   │
-│   ├── api/
-│   │   └── v1/
-│   │       ├── __init__.py
-│   │       ├── auth.py             # login / refresh / logout
-│   │       ├── health.py           # /healthz + /admin/queue-stats
-│   │       ├── knowledge.py        # knowledge CRUD (admin)
-│   │       ├── orders.py           # order create + track
-│   │       └── queries.py          # create / read / answer / feedback / admin feed
-│   │
-│   ├── models/
-│   │   └── tables.py               # 10 SQLAlchemy ORM tables
-│   │
-│   ├── schemas/
-│   │   └── dto.py                  # Pydantic request/response schemas
-│   │
-│   └── services/
-│       ├── ai_service.py           # Gemini client (typed errors, retry, 10s timeout)
-│       ├── mail.py                 # Idempotent outbox + SMTP delivery
-│       ├── prompt_context.py       # Grounds AI in KB + live order facts
-│       └── worker.py               # Claim/drain loop, state machine, reaper
-├── tests/
-│   ├── conftest.py
-│   ├── test_env_example.py
-│   ├── test_health.py
-│   └── test_queries.py
-
-## Scale — Endpoints, Tables, Migrations
-
-| Layer | Count | Details |
-|-------|-------|---------|
-| API routers | 5 | auth, health, knowledge, orders, queries |
-| API endpoints | 9 | See [API Reference](#api-reference) |
-| DB tables | 10 | users, refresh_tokens, support_queries, support_answers, knowledge_answers, knowledge_answer_versions, email_outbox, feedback, orders, order_events |
-| Alembic migrations | 1 | Base schema (initial) |
-
-## Tests
-
-| Metric | Value |
-|--------|-------|
-| Test files | 9 (`conftest.py` + 8 test modules) |
-| Tests | 111 |
-| Passing | 100% (111/111) |
-| Runner | `pytest` |
-
-## Speed & Performance
-
-| Metric | Target | Measured |
-|--------|--------|----------|
-| POST /queries (inline, excl. AI) | <100ms | — |
-| Gemini call (hard cap) | 10s timeout | — |
-| Queue claim + process | ~11s worst case | — |
-| Worker poll interval | 1s | — |
-| Rate limit | 30 POST /queries per IP / min | In-memory (stdlib) |
-| DB ping (`/healthz`) | 2s short timeout | — |
-| Worker reaper threshold | 60s stale `processing` | — |
-
-## Observability & Security
-
-| Component | Status | Detail |
-|-----------|--------|--------|
-| Structured logging | JSON lines to stdout | `ts`, `level`, `service`, `version`, `request_id`, `endpoint`, `latency_ms`, `message`, `module` |
-| Correlation ID | `X-Request-ID` header | Propagated via `contextvars` (survives `await`); echoed in response headers |
-| Request latency | `X-Process-Time` header | Measured per request, logged in JSON |
-| Security headers | All responses | `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection`, `Strict-Transport-Security`, `Content-Security-Policy: default-src 'self'` |
-| Secret redaction | Log formatter | `Authorization`, `X-Admin-Key`, `GEMINI_API_KEY`, `JWT_SECRET_KEY`, `ADMIN_API_KEY`, `SMTP_PASSWORD`, `DATABASE_URL` redacted |
-| Health check depth | `/healthz` | DB ping (2s timeout) + Gemini `count_tokens` (cached 30s) |
-| DB connection pool | SQLAlchemy | `pool_size=20`, `max_overflow=40`, `pool_pre_ping=True` |
-| Request timeout | Middleware | 30s per route, returns 504 on timeout |
-
-## RAG & Knowledge Base
-
-| Component | Status | Detail |
-|-----------|--------|--------|
-| Knowledge tables | Implemented | `knowledge_answers` + `knowledge_answer_versions` (draft → current) |
-| Grounding source | Live policy + order facts | `prompt_context.py` joins all *current* policy versions into one labeled block |
-| Order auto-resolution | Implemented | Server matches open orders by email before the single Gemini call |
-| Embeddings / vector search | Not used | SQL-based lookup (no pgvector dependency) |
-| Multi-policy grounding | Implemented | All active knowledge versions are joined, not just `.first()` |
-| RAG accuracy benchmark | Not yet measured | Run `pytest` + manual review of AI answers against KB |
-
-### How grounding works (single AI call)
-
-1. `build_prompt_context()` loads every `knowledge_answer_version` where `is_current = true`, joined to its parent `knowledge_answer` for the topic label.
-2. Order facts are resolved server-side: if the customer is authenticated and has exactly one open order, its tracking facts (stage, location, ETA, stalled flag) are injected.
-3. The combined policy + situation block is sent to Gemini with `temperature=0.2`, `max_output_tokens=300`.
-4. The model must answer, list options, or ask for clarification — never invent policy details.
-
-## AI Tool Calling & Human Handoff
-
-### Capabilities (4 AI functions)
-
-| Tool | Purpose |
-|------|---------|
-| Intent classification | Classifies question into 7 intent buckets (order tracking, refund, payment, etc.) |
-| Answer generation | Grounded answer from KB + order facts |
-| Order tracking | Live order facts (stage, location, ETA, stalled) |
-| Human handoff | Escalation when AI is blocked or exhausts retries |
-
-### Escalation state machine
+## Queue and retry behavior
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Queued
-    Queued --> Processing: claim (FOR UPDATE SKIP LOCKED)
-    Processing --> Resolved: AI answers successfully
-    Processing --> NeedsHuman: AIContentBlockedError (no retry)
-    Processing --> Queued: retry (attempt < 3, backoff 2/4/8 min)
-    Processing --> NeedsHuman: attempt 3 exhausted
-    NeedsHuman --> Queued: admin requeue (POST /queries/{id}/requeue)
-    NeedsHuman --> [*]: human agent answers
+    [*] --> queued
+    queued --> processing: worker claim
+    processing --> resolved: validated answer
+    processing --> queued: transient failure, attempt < 3
+    processing --> needs_human: blocked or attempts exhausted
+    processing --> queued: stale row reclaimed after 60s
+    needs_human --> queued: admin requeue
+    needs_human --> resolved: human answer
+    resolved --> [*]
 ```
 
-### Escalation rules
+- Queue claims use PostgreSQL row locking and `SKIP LOCKED`.
+- Each worker attempt makes one Gemini call.
+- Retry backoff is 2, 4, and 8 minutes.
+- Maximum AI attempts per query: 3.
+- Blocked or unsafe model output goes directly to human support.
+- A stale `processing` row is reclaimed after 60 seconds.
+- The worker heartbeat is stored in Redis when available and exposed through admin queue statistics.
 
-- **Max AI attempts:** 3 per query
-- **Backoff:** 2 → 4 → 8 minutes (exponential between attempts)
-- **AIContentBlockedError** → instant human handoff (never retried — saves Gemini quota)
-- **Reaper:** reclaims stale `processing` rows (>60s) after worker crash/hang
-- **Human feed:** `GET /admin/needs-human` lists queries needing agent attention
-- **Requeue:** `POST /queries/{id}/requeue` returns a `processing` or `needs_human` row to `queued` for one fresh AI attempt
+## Email delivery
 
-## Redis & Caching
+The `email_outbox` table is the durable source of truth for outbound resolution mail.
 
-| Item | Status | Detail |
-|------|--------|--------|
-| Redis | Not used | No Redis dependency in `requirements.txt` |
-| Rate limiting | In-memory | `defaultdict` sliding window, 30 req/IP/min (stdlib-only) |
-| Session store | DB | Refresh tokens in PostgreSQL (`refresh_tokens` table) |
-| Query cache | None | Every AI call hits Gemini fresh |
-| Planned (Phase C) | Redis | Swap in-memory rate limiter + add response cache when scaling beyond a single instance |
+- `idempotency_key` prevents duplicate queue rows.
+- `sending` rows have `locked_at` and `locked_by` delivery leases.
+- Workers claim rows with a short database transaction before calling SMTP.
+- Stale leases are recoverable after the delivery lease expires.
+- A deterministic `Message-ID` is generated from the idempotency key.
+- Raw SMTP is still technically at-least-once if a process crashes after SMTP accepts a message but before the database is updated. A provider with idempotency-key support is required for stronger exactly-once behavior.
 
-## Gemini Integration
+Mailpit is used only for local development. Production must use a real transactional email provider with TLS, credentials, bounce monitoring, and provider-side idempotency support.
 
-| Item | Value |
-|------|-------|
-| Model | `gemini-3.5-flash-lite` |
-| Timeout | 10s hard cap per attempt |
-| Temperature | 0.2 (deterministic) |
-| Max output tokens | 300 |
-| Retry policy | 3 attempts, exponential jitter (0.5s–4s) |
-| Retryable errors | 429, 5xx, timeouts, connection errors |
-| Non-retryable | `AIContentBlockedError` (safety filter / empty answer) |
-| Single-attempt variant | `answer_customer_question_once()` (queue workers) |
-| JSON mode | Intent classification forces `application/json` MIME type |
+## Redis, caching, and rate limiting
 
-## Getting Started
+| Feature | Implementation |
+|---|---|
+| Distributed rate limiting | Redis sliding window, 30 protected requests per client per minute |
+| Rate-limit key privacy | HMAC digest; raw client IP is not stored in Redis |
+| AI response cache | Redis, 600-second default TTL |
+| Cache stampede lock | Redis `SET NX` lock with configurable TTL |
+| Worker heartbeat | Redis hash with 30-second expiry |
+| Redis failure behavior | Cache degrades safely; configured rate-limit failures return `503` rather than silently removing protection |
+| Local fallback | In-memory rate limiter only when `REDIS_URL` is not configured |
 
-### Prerequisites
+## Authentication and security
 
-- Python 3.10+
-- PostgreSQL (or set `DATABASE_URL` to an existing instance)
-- Google Gemini API key
-- Docker (optional — for the Compose stack)
-- SMTP server (Mailpit works locally: `SMTP_HOST=localhost SMTP_PORT=1025`)
+- Access tokens use HS256 with a configured secret and a 15-minute lifetime.
+- Refresh tokens are opaque random values; only SHA-256 hashes are stored.
+- Refresh-token rotation detects reuse and revokes the entire token family.
+- Admin endpoints require `X-Admin-Key` and fail closed when no key is configured.
+- Customer data access is scoped to the verified JWT email in production.
+- Passwords use PBKDF2-HMAC-SHA256 with 210,000 iterations and per-user salts.
+- Request IDs, structured logging, secret redaction, security headers, and a configurable request timeout are enabled.
+- API and worker containers run as a non-root user.
 
-### Install
+Production still needs HTTPS at a reverse proxy, secret-manager integration, secure `HttpOnly` refresh-token cookies with CSRF protection, admin rate limiting, dependency/image scanning, and tested backup restoration.
+
+## API reference
+
+### Queries
+
+| Method | Endpoint | Purpose | Authentication |
+|---|---|---|---|
+| POST | `/queries` | Submit a support query; returns `202` | JWT required in production |
+| GET | `/queries/{query_id}` | Read query status | JWT required in production |
+| GET | `/queries/{query_id}/answer` | Read the latest answer | JWT required in production |
+| PATCH | `/queries/{query_id}/feedback` | Submit a 1–5 rating and comment | JWT required in production |
+| PATCH | `/queries/{query_id}` | Admin status transition | Admin key |
+| PATCH | `/queries/{query_id}/answer` | Submit a human answer | Admin key |
+| POST | `/queries/{query_id}/requeue` | Requeue processing/human-review item | Admin key |
+| GET | `/admin/needs-human` | List human-support items | Admin key |
+
+### Authentication
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| POST | `/auth/login` | Issue access and refresh tokens |
+| POST | `/auth/refresh` | Rotate a refresh token |
+| POST | `/auth/logout` | Revoke a refresh-token family member |
+
+### Operations and data
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/healthz` | Database and Gemini health probe |
+| GET | `/admin/queue-stats` | Queue counts and worker heartbeat; admin key |
+| POST | `/orders` | Create order and events; admin key |
+| GET | `/orders/{order_number}` | Read authenticated order tracking |
+| POST | `/knowledge` | Create a draft knowledge answer; admin key |
+
+The frontend must support `queued`, `processing`, `resolved`, `needs_human`, and `closed` states. In queued mode, it should poll `/queries/{query_id}` and request `/queries/{query_id}/answer` after resolution.
+
+## Configuration
+
+Copy `.env.example` to `.env` and replace every placeholder with a secure value.
+
+| Variable | Default | Required | Description |
+|---|---:|:---:|---|
+| `DATABASE_URL` | — | Yes | SQLAlchemy PostgreSQL URL |
+| `POSTGRES_USER` | `supportiq` | No | Compose database user |
+| `POSTGRES_PASSWORD` | — | Yes for Compose | Compose database password |
+| `POSTGRES_DB` | `supportiq` | No | Compose database name |
+| `GEMINI_API_KEY` | — | Yes | Google Gemini credential |
+| `JWT_SECRET_KEY` | — | Yes | Access-token signing secret |
+| `ADMIN_API_KEY` | — | No | Admin key; absent means fail closed |
+| `CACHE_KEY_SECRET` | — | Yes with Redis | HMAC secret for cache/rate-limit keys |
+| `REDIS_URL` | — | No locally | Redis URL for distributed cache and limiting |
+| `AI_CACHE_TTL_SECONDS` | `600` | No | Successful answer cache TTL |
+| `AI_CACHE_LOCK_SECONDS` | `15` | No | Cache stampede lock TTL |
+| `QUERY_MODE` | `inline` | No | `inline` or `queued`; Compose uses `queued` |
+| `REFRESH_TOKEN_MINUTES` | `720` | No | Absolute refresh-token lifetime |
+| `EMAIL_DELIVERY_LEASE_SECONDS` | `120` | No | Email outbox lease duration |
+| `WORKER_ID` | hostname | No | Must be unique when scaling workers |
+| `SMTP_HOST` | `localhost` | No | SMTP host; Compose uses Mailpit |
+| `SMTP_PORT` | `1025` | No | SMTP port |
+| `SMTP_USER` | empty | No | SMTP username |
+| `SMTP_PASSWORD` | empty | No | SMTP password |
+| `MAIL_FROM` | `support@supportiq.local` | No | Sender address |
+| `MAIL_FROM_NAME` | `SupportIq` | No | Sender display name |
+
+## Running locally
+
+### Docker Compose
+
+Docker Compose starts PostgreSQL, Redis, Mailpit, the Alembic migration service, the API, and the dedicated worker.
+
+```powershell
+docker compose up --build
+```
+
+Endpoints:
+
+- API: `http://127.0.0.1:8765`
+- Health: `http://127.0.0.1:8765/healthz`
+- Mailpit UI: `http://127.0.0.1:8025`
+- SMTP: `127.0.0.1:1025`
+
+Stop services while preserving volumes and database data:
+
+```powershell
+docker compose stop
+```
+
+Start them again:
+
+```powershell
+docker compose start
+```
+
+Do not use `docker compose down -v` unless intentionally deleting the local database and Redis volumes.
+
+### Local Python process
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-```
-
-### Configure
-
-Copy `.env.example` to `.env` and fill in:
-
-```powershell
-DATABASE_URL=postgresql+psycopg2://user:pass@localhost:5432/supportiq
-GEMINI_API_KEY=your-google-ai-studio-key
-JWT_SECRET_KEY=change-this-in-production
-ADMIN_API_KEY=change-this-in-production
-SMTP_HOST=localhost
-SMTP_PORT=1025
-QUERY_MODE=inline   # or "queued" for background worker
-REFRESH_TOKEN_MINUTES=30
-```
-
-### Run the API (local, no Docker)
-
-```powershell
 uvicorn app.main:app --reload
 ```
 
-### Run with Docker Compose (recommended — includes Postgres + Mailpit)
+For queued processing in a separate terminal:
 
 ```powershell
-docker compose up --build
-# App:        http://127.0.0.1:8765
-# Mailpit UI: http://127.0.0.1:8025
-# Postgres:   localhost:5433
-docker compose down -v   # wipe containers + db volume (clean slate)
+$env:QUERY_MODE = "queued"
+python -m app.services.worker
 ```
 
-### Run the worker standalone (queued mode only)
+## Testing
+
+Tests are designed to run offline with SQLite and mocked AI behavior.
 
 ```powershell
-QUERY_MODE=queued python -m app.worker
+python -m pytest -q
 ```
 
-### Run tests
+The latest verified run passed 126 tests. Coverage includes API behavior, authentication and refresh-token rotation, privacy, queue claims and reaping, worker lifecycle substitution, AI graph validation, email outbox behavior, application-service ports, and health endpoints.
 
-```powershell
-python -m pytest tests/ -q
-```
+Static diagnostics and `git diff --check` should also be run before committing.
 
-## API Reference
+## Deployment status and remaining work
 
-### Queries
+### Implemented
 
-| Method | Endpoint | Description | Auth |
-|--------|----------|-------------|------|
-| POST | `/queries` | Create a support query (202 Accepted) | Optional JWT |
-| GET | `/queries/{id}` | Get query status & answer | Optional JWT |
-| GET | `/queries/{id}/answer` | Get the latest answer | Optional JWT |
-| POST | `/queries/{id}/feedback` | Submit rating 1-5 + comment | Optional JWT |
-| GET | `/admin/needs-human` | List queries needing human attention | Admin key |
-| POST | `/queries/{id}/requeue` | Requeue a stuck/needs-human query | Admin key |
+- Dockerfile with Python 3.12 slim base and non-root runtime user.
+- Separate migration, API, and worker services.
+- PostgreSQL health-gated migrations.
+- Redis-backed distributed rate limiting and answer caching.
+- Durable worker queue and email outbox.
+- Alembic schema migrations through the current email-delivery lease migration.
+- Application ports and service layer for answer generation.
+- Structured logs, correlation IDs, timeout middleware, and security headers.
 
-### Auth
+### Required before production
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/auth/login` | Issue access + refresh tokens |
-| POST | `/auth/refresh` | Rotate refresh token |
-| POST | `/auth/logout` | Revoke refresh token family |
-
-### Health
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/healthz` | Service health (open, DB ping) |
-| GET | `/admin/queue-stats` | Queue stats + worker heartbeat (admin key) |
-
-### Knowledge
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/knowledge` | Create knowledge answer + version (draft status) |
-
-### Orders
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/orders` | Create order + events (admin key) |
-| GET | `/orders/{number}` | Order details + tracking facts |
-
-## Environment Variables
-
-| Variable | Default | Required | Description |
-|----------|---------|----------|-------------|
-| `DATABASE_URL` | — | Yes | PostgreSQL connection string (`+psycopg` driver) |
-| `GEMINI_API_KEY` | — | Yes | Google AI Studio / Gemini API key |
-| `JWT_SECRET_KEY` | — | Yes | HS256 signing key for access tokens |
-| `ADMIN_API_KEY` | — | No (fail-closed) | Admin key for `/admin/*` endpoints |
-| `SMTP_HOST` | `localhost` | No | SMTP server |
-| `SMTP_PORT` | `1025` | No | SMTP port |
-| `SMTP_USER` | `""` | No | SMTP username |
-| `SMTP_PASSWORD` | `""` | No | SMTP password |
-| `MAIL_FROM` | `support@supportiq.local` | No | From address |
-| `MAIL_FROM_NAME` | `SupportIq` | No | From name |
-| `QUERY_MODE` | `inline` | No | `inline` or `queued` |
-| `REFRESH_TOKEN_MINUTES` | `30` | No | Refresh token lifetime (absolute, anchored to family root) |
-
-## Deployment & Status
-
-| Item | Status |
-|------|--------|
-| **Container** | Dockerfile (`python:3.12-slim`, non-root user, healthcheck on `/healthz`) |
-| **Compose stack** | `docker-compose.yml`: api + `postgres:16-alpine` + Mailpit |
-| **Local run** | `docker compose up --build` → app at `:8765`, Mailpit at `:8025` |
-| **Healthcheck** | Container `/healthz` probes DB + worker state |
-| **CI/CD** | None configured |
-| **Cloud deploy** | Not yet deployed to AWS / any cloud |
-| **Team size** | Solo developer (full stack) |
-| **Production readiness** | Core logic complete; needs RAG eval, latency benchmark, deploy config |
+- Replace Mailpit with a production transactional email provider.
+- Add HTTPS reverse proxy or cloud load balancer.
+- Add CORS configuration for the deployed frontend origin.
+- Add separate liveness and readiness probes.
+- Enable worker healthchecks and unique worker IDs when scaling.
+- Add PostgreSQL backups and a tested restore procedure.
+- Add metrics, centralized logs, queue alerts, and provider failure alerts.
+- Move secrets to a managed secret store.
+- Add frontend integration tests and normalize error responses.
+- Protect refresh-token rotation with a database row lock for concurrent refresh requests.
+- Recalculate connection-pool limits when running multiple API replicas.
 
 ## License
 
@@ -400,4 +382,4 @@ Private / internal use.
 
 ---
 
-*Last updated: 2026-10-21*
+*Last updated: 2026-11-03*
