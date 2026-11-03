@@ -35,6 +35,7 @@ from app.services.ai_service import (
     AITimeoutError,
     answer_customer_question_once,
 )
+from app.services.agent_graph import run_support_graph
 from app.core.database import SessionLocal
 from app.services.mail import process_outbox, queue_email, resolution_email
 from app.models.tables import AGING_SECONDS_PER_POINT, SupportQuery, Support_Answer
@@ -245,14 +246,22 @@ def process_one(db: Session, query: SupportQuery) -> str:
         if cached is not None:
             result = cached
         else:
-            generated = answer_customer_question_once(
+            graph_result = run_support_graph(
                 query.question,
                 policy_context=ctx.policy_context,
                 situation=ctx.situation,
+                # Inject the one-attempt provider boundary so tests and
+                # future providers do not couple the graph to Gemini.
+                answer_fn=answer_customer_question_once,
             )
+            if graph_result.outcome != "resolved" or not graph_result.answer_text:
+                raise AIContentBlockedError(
+                    graph_result.validation_error
+                    or "graph routed query to human support"
+                )
             result = CachedAnswer(
-                intent=generated.intent,
-                answer_text=generated.answer_text,
+                intent=graph_result.intent,
+                answer_text=graph_result.answer_text,
             )
             answer_cache.set(cache_key, result)
     except (AIRateLimitError, AITimeoutError,
