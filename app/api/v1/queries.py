@@ -115,7 +115,8 @@ def create_query(request: SupportRequest, http_request: Request,
                          customer_email=request.customer_email,
                          order_number=request.order_number,
                          purchase_date=request.purchase_date,
-                         order_status=request.order_status)
+                         order_status=request.order_status,
+                         tenant_id=(identity or {}).get("tenant_id"))
     db.add(query)
     db.commit()
     db.refresh(query)
@@ -131,6 +132,7 @@ def create_query(request: SupportRequest, http_request: Request,
         # JWT-verified email matches the query's email -- body email alone is
         # spoofable, so anonymous callers get a polite ask instead.
         auth_email=(identity or {}).get("email"),
+        tenant_id=(identity or {}).get("tenant_id"),
     )
 
     if ctx.resolved_order_number and not query.order_number:

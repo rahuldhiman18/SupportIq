@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.logging import endpoint_var, request_id_var
+from app.core.api_errors import public_error_payload
 
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -47,7 +48,13 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
         except asyncio.TimeoutError:
             return JSONResponse(
                 status_code=504,
-                content={"status": "degraded", "error": "request timeout"},
+                content={
+                    **public_error_payload(
+                        code="timeout",
+                        message="The request timed out. Please try again.",
+                    ),
+                    "status": "degraded",
+                },
             )
 
 

@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.tables import RefreshToken, User
+from app.core.deps import get_db
 
 
 # ** Phase A auth: admin key guards the critical write endpoints,
@@ -64,6 +65,14 @@ bearer_scheme = HTTPBearer(auto_error=False)
 def _jwt_secret() -> str:
     secret = os.getenv("JWT_SECRET_KEY")
     if secret:
+        production = os.getenv("APP_ENV", "development").lower() in {
+            "prod", "production"
+        }
+        if production and len(secret.encode("utf-8")) < 32:
+            raise HTTPException(
+                status_code=503,
+                detail="JWT signing key does not meet the minimum security requirement",
+            )
         return secret
     # Offline-test fallback ONLY: same fail-closed rule as the admin key --
     # a predictable secret in prod would let anyone forge admin tokens.
@@ -83,12 +92,23 @@ def _b64url_decode(data: str) -> bytes:
 
 def issue_access_token(user: "User") -> str:
     header = _b64url(_json.dumps({"alg": _JWT_ALGO, "typ": "JWT"}).encode())
-    payload = _b64url(_json.dumps({
+    payload_claims = {
         "sub": user.username,
         "email": user.email,
         "role": user.role,
+        "tenant_id": getattr(user, "tenant_id", None),
+        "token_version": getattr(user, "token_version", 0),
+        "jti": str(uuid4()),
+        "iat": int(time.time()),
         "exp": int(time.time()) + _ACCESS_TOKEN_MINUTES * 60,
-    }).encode())
+    }
+    issuer = os.getenv("JWT_ISSUER")
+    audience = os.getenv("JWT_AUDIENCE")
+    if issuer:
+        payload_claims["iss"] = issuer
+    if audience:
+        payload_claims["aud"] = audience
+    payload = _b64url(_json.dumps(payload_claims).encode())
     sig = _b64url(hmac.new(_jwt_secret().encode(), f"{header}.{payload}".encode(),
                            hashlib.sha256).digest())
     return f"{header}.{payload}.{sig}"
@@ -97,6 +117,11 @@ def issue_access_token(user: "User") -> str:
 def verify_access_token(token: str) -> dict:
     try:
         header, payload, sig = token.split(".")
+        header_claims = _json.loads(_b64url_decode(header))
+        if header_claims.get("alg") != _JWT_ALGO:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        if header_claims.get("typ") != "JWT":
+            raise HTTPException(status_code=401, detail="Invalid token")
         expected = _b64url(hmac.new(
             _jwt_secret().encode(), f"{header}.{payload}".encode(),
             hashlib.sha256).digest())
@@ -107,8 +132,32 @@ def verify_access_token(token: str) -> dict:
         raise
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
-    if claims.get("exp", 0) < int(time.time()):
+    exp = claims.get("exp")
+    if not isinstance(exp, int) or exp < int(time.time()):
         raise HTTPException(status_code=401, detail="Token expired")
+    iat = claims.get("iat")
+    if iat is not None and (not isinstance(iat, int) or iat > int(time.time()) + 30):
+        raise HTTPException(status_code=401, detail="Invalid token")
+    if not isinstance(claims.get("sub"), str):
+        raise HTTPException(status_code=401, detail="Invalid token")
+    if not isinstance(claims.get("email"), str):
+        raise HTTPException(status_code=401, detail="Invalid token")
+    if not isinstance(claims.get("role"), str):
+        raise HTTPException(status_code=401, detail="Invalid token")
+    if not isinstance(claims.get("jti"), str):
+        raise HTTPException(status_code=401, detail="Invalid token")
+    issuer = os.getenv("JWT_ISSUER")
+    if issuer and claims.get("iss") != issuer:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    audience = os.getenv("JWT_AUDIENCE")
+    if audience:
+        token_audience = claims.get("aud")
+        if isinstance(token_audience, list):
+            audience_valid = audience in token_audience
+        else:
+            audience_valid = token_audience == audience
+        if not audience_valid:
+            raise HTTPException(status_code=401, detail="Invalid token")
     return claims
 
 
@@ -127,11 +176,33 @@ def verify_password(password: str, salt: str, expected_hash: str) -> bool:
 
 def current_identity(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
 ) -> dict | None:
     """Logged-in claims, or None for anonymous callers (routes stay open)."""
     if credentials is None or credentials.scheme.lower() != "bearer":
         return None
-    return verify_access_token(credentials.credentials)
+    claims = verify_access_token(credentials.credentials)
+    user = db.execute(
+        select(User).where(
+            (User.username == claims["sub"]) | (User.email == claims["email"])
+        )
+    ).scalars().first()
+    if (
+        user is None
+        or not user.is_active
+        or user.email.lower() != claims["email"].lower()
+        or user.username != claims["sub"]
+        or user.role != claims["role"]
+        or getattr(user, "token_version", 0) != claims.get("token_version", 0)
+        or getattr(user, "tenant_id", None) != claims.get("tenant_id")
+    ):
+        raise HTTPException(status_code=401, detail="Token is no longer valid")
+    return {
+        **claims,
+        "tenant_id": getattr(user, "tenant_id", None),
+        "email": user.email,
+        "role": user.role,
+    }
 
 
 def require_customer_identity(
@@ -209,7 +280,7 @@ def revoke_refresh_family(db: Session, family_id: UUID) -> None:
         select(RefreshToken).where(
             RefreshToken.family_id == family_id,
             RefreshToken.revoked_at.is_(None),
-        )
+        ).with_for_update()
     ).scalars().all():
         row.revoked_at = now
     db.commit()
@@ -222,7 +293,8 @@ def rotate_refresh_token(db: Session, raw: str) -> tuple["User", str, str]:
     from app.models.tables import utcnow_unique
     row = db.execute(
         select(RefreshToken).where(
-            RefreshToken.token_hash == _hash_refresh_token(raw))
+            RefreshToken.token_hash == _hash_refresh_token(raw)
+        ).with_for_update()
     ).scalars().first()
     if row is None:
         raise HTTPException(status_code=401, detail="Invalid refresh token")

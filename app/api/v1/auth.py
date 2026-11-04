@@ -13,7 +13,7 @@ from app.schemas.dto import (
 )
 from app.core.security import (
     _hash_refresh_token, _refresh_ttl_minutes, issue_access_token,
-    issue_refresh_token, rotate_refresh_token, verify_password,
+    issue_refresh_token, revoke_refresh_family, rotate_refresh_token, verify_password,
 )
 
 router = APIRouter(tags=["auth"])
@@ -68,5 +68,9 @@ def logout_session(request: LogoutRequest, db: Session = Depends(get_db)):
     ).scalars().first()
     if row is not None and row.revoked_at is None:
         row.revoked_at = datetime.now(timezone.utc)
+        revoke_refresh_family(db, row.family_id)
+        user = db.get(User, row.user_id)
+        if user is not None:
+            user.token_version += 1
         db.commit()
     return {"logged_out": True}

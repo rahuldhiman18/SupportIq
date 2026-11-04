@@ -98,6 +98,7 @@ class SupportQuery(Base):
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True),
                                                            nullable=True)
     last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Step 3b request context: queued mode persists the SupportRequest extras
     # so the worker rebuilds the identical prompt (order facts, purchase-date
     # math, order-status hint) after the HTTP request is long gone.
@@ -130,6 +131,10 @@ class KnowledgeAnswer(Base):
     is_active: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone =True),default=lambda:datetime.now(timezone.utc))
     source_url: Mapped[str] = mapped_column(String, nullable=False)
+    tenant_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    __table_args__ = (
+        Index("ix_knowledge_answers_tenant", "tenant_id"),
+    )
 
 class KnowledgeAnswerVersion(Base):
     __tablename__="knowledge_answer_versions"
@@ -175,6 +180,7 @@ class KnowledgeChunk(Base):
     knowledge_answer_id: Mapped[UUID] = mapped_column(
         ForeignKey("knowledge_answers.id"), nullable=False
     )
+    tenant_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     knowledge_version_id: Mapped[UUID] = mapped_column(
         ForeignKey("knowledge_answer_versions.id"), nullable=False
     )
@@ -212,6 +218,11 @@ class KnowledgeChunk(Base):
             "ix_knowledge_chunks_answer_version",
             "knowledge_answer_id",
             "knowledge_version_id",
+        ),
+        Index(
+            "ix_knowledge_chunks_tenant_active",
+            "tenant_id",
+            "is_active",
         ),
     )
 
@@ -363,6 +374,8 @@ class User(Base):
     password_salt: Mapped[str] = mapped_column(String, nullable=False)
     role: Mapped[str] = mapped_column(String, default="customer")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -446,4 +459,3 @@ class Feedback(Base):
     )
 
     query: Mapped["SupportQuery"] = relationship()
-

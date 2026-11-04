@@ -11,6 +11,8 @@ Dependency direction (no cycles):
   main      -> api/v1/*, services.worker
 """
 from fastapi import FastAPI
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+import os
 
 from app.api.v1 import auth as routes_auth
 from app.api.v1 import health as routes_health
@@ -24,6 +26,7 @@ from app.core.middleware import (
     LoggingMiddleware,
     TimeoutMiddleware,
 )
+from app.core.api_errors import register_api_exception_handlers
 from app.services.prompt_context import build_prompt_context, _extract_order_number  # noqa: F401
 from app.core.security import (  # noqa: F401 (re-exported for tests/scripts)
     _ACCESS_TOKEN_MINUTES,
@@ -53,6 +56,18 @@ from app.api.v1.queries import answer_customer_question  # noqa: F401
 setup_logging()
 
 app = FastAPI(title="SupportIq")
+register_api_exception_handlers(app)
+
+# Production deployments must only accept approved public hostnames. Keep
+# development/test hosts unrestricted so offline TestClient suite behavior is
+# unchanged.
+if os.getenv("APP_ENV", "development").lower() in {"prod", "production"}:
+    _allowed_hosts = [
+        host.strip()
+        for host in os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+        if host.strip()
+    ]
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts)
 
 # Correlation + security headers middleware (outermost: runs first on request,
 # last on response -- sets context vars before LoggingMiddleware captures them).
@@ -72,4 +87,3 @@ app.include_router(routes_knowledge.router)
 # Queue execution intentionally does not live in the HTTP composition root.
 # The standalone worker service owns app.services.worker.run_forever. This
 # keeps API lifecycle, queue execution, and deployment scaling independent.
-

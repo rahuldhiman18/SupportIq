@@ -59,6 +59,7 @@ def build_prompt_context(
     purchase_date: date | None = None,
     order_status: str | None = None,
     auth_email: str | None = None,
+    tenant_id: str | None = None,
 ) -> PromptContext:
     """Build policy + situation context exactly as inline mode always did."""
     # ** Find ALL current approved knowledge versions (source of truth), each
@@ -72,6 +73,13 @@ def build_prompt_context(
             KnowledgeAnswerVersion.knowledge_answer_id == KnowledgeAnswer.id,
         )
         .where(KnowledgeAnswerVersion.is_current.is_(True))
+        .where(KnowledgeAnswerVersion.status == "approved")
+        .where(KnowledgeAnswer.is_active.is_(True))
+        .where(
+            KnowledgeAnswer.tenant_id == tenant_id
+            if tenant_id is not None
+            else KnowledgeAnswer.tenant_id.is_(None)
+        )
         .order_by(KnowledgeAnswer.canonical_question)
     ).all()
 

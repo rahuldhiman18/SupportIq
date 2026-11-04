@@ -42,6 +42,17 @@ _GROUNDING_STOPWORDS = frozenset(
     "the their this to was we were will with your you".split()
 )
 
+_PROMPT_INJECTION_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE | re.DOTALL)
+    for pattern in (
+        r"\bignore\s+(?:all\s+|any\s+|previous\s+|above\s+)?(?:instructions|rules)\b",
+        r"\b(?:disclose|reveal|print)\s+(?:the\s+)?(?:system|hidden|developer)\s+(?:prompt|instructions)\b",
+        r"\byou\s+are\s+(?:now|actually)\s+(?:an?\s+)?(?:unrestricted|different)",
+        r"<\s*(?:system|developer|admin)\b",
+        r"\b(?:override|bypass)\s+(?:safety|security|authorization)\b",
+    )
+)
+
 
 GraphOutcome = Literal["resolved", "needs_human"]
 IdentityScope = Literal[
@@ -127,6 +138,26 @@ def _validate(state: SupportGraphState) -> SupportGraphState:
             "validation_result": "invalid",
             "human_handoff_reason": "model returned an empty answer",
         }
+    question = state.get("customer_question", "")
+    for pattern in _PROMPT_INJECTION_PATTERNS:
+        if pattern.search(question) or pattern.search(answer_text):
+            return {
+                "outcome": "needs_human",
+                "validation_result": "invalid",
+                "human_handoff_reason": "prompt injection or instruction override detected",
+            }
+    for source_text in (
+        state.get("approved_policy_context"),
+        state.get("verified_order_facts"),
+    ):
+        if source_text and any(
+            pattern.search(source_text) for pattern in _PROMPT_INJECTION_PATTERNS
+        ):
+            return {
+                "outcome": "needs_human",
+                "validation_result": "invalid",
+                "human_handoff_reason": "untrusted source contains instruction override content",
+            }
     if len(answer_text) > MAX_ANSWER_CHARS:
         return {
             "outcome": "needs_human",

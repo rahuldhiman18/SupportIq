@@ -221,6 +221,7 @@ def process_one(db: Session, query: SupportQuery) -> str:
         # persisting the row. The worker has no JWT, so it uses only this
         # trusted, server-persisted identity for the order lookup.
         auth_email=query.customer_email,
+        tenant_id=query.tenant_id,
     )
     if ctx.knowledge_version_id is not None:
         query.knowledge_version_id = ctx.knowledge_version_id

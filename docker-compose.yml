@@ -1,5 +1,5 @@
 # Local prod-like stack: api + Postgres + Mailpit (mail sink for the outbox).
-# Run:  docker compose up --build      -> app at http://127.0.0.1:8765
+# Run: docker compose up --build -> HTTPS at https://localhost
 #       docker compose down -v         -> wipe containers + db volume (clean slate)
 # 8GB-safe: this file is small on its own; cap WSL2 memory (see .wslconfig) so
 # the Docker VM cannot starve Windows.
@@ -15,7 +15,10 @@ x-supportiq-environment: &supportiq-environment
   REFRESH_TOKEN_MINUTES: ${REFRESH_TOKEN_MINUTES:-720}
   GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY in .env}
   JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY in .env}
+  JWT_ISSUER: ${JWT_ISSUER:-supportiq-api}
+  JWT_AUDIENCE: ${JWT_AUDIENCE:-supportiq-api}
   ADMIN_API_KEY: ${ADMIN_API_KEY:?set ADMIN_API_KEY in .env}
+  ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1}
   SMTP_HOST: mailpit
   SMTP_PORT: 1025
 
@@ -34,14 +37,26 @@ services:
 
   api:
     build: .
-    ports:
-      - "8765:8000"          # host 8765 -> container 8000 (approved)
     environment: *supportiq-environment
     depends_on:
       migrate:
         condition: service_completed_successfully
       mailpit:
         condition: service_started
+    restart: unless-stopped
+
+  proxy:
+    image: nginx:1.27-alpine
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${TLS_FULLCHAIN_PATH:-./certs/fullchain.pem}:/etc/nginx/certs/fullchain.pem:ro
+      - ${TLS_PRIVATE_KEY_PATH:-./certs/privkey.pem}:/etc/nginx/certs/privkey.pem:ro
     restart: unless-stopped
 
   worker:

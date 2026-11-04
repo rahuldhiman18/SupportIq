@@ -2,7 +2,7 @@
 
 SupportIq is an AI-powered customer-support backend built with FastAPI, PostgreSQL, Redis, and Google Gemini. It grounds answers in approved knowledge and verified order facts, supports inline and queued processing, and escalates unsafe or unresolved answers to human support.
 
-> **Current status:** staging-ready local deployment. The Docker Compose stack is operational, but production still needs a real email provider, HTTPS/load balancing, worker health monitoring, backups, and observability.
+> **Current status:** staging-ready local deployment. The Docker Compose stack includes an HTTPS reverse proxy, but production still needs real certificates, a real email provider, worker health monitoring, backups, and observability.
 
 ## Contents
 
@@ -37,6 +37,7 @@ SupportIq is an AI-powered customer-support backend built with FastAPI, PostgreS
 - Structured JSON logging, correlation IDs, security headers, and request timeouts.
 - LangGraph-based bounded AI workflow with no database or email side effects inside the graph.
 - PostgreSQL `pgvector` support and a versioned knowledge-chunk schema prepared for future RAG indexing.
+- Hybrid retrieval abstractions for query embeddings, approved PostgreSQL vector/full-text search, tenant filtering, result merging, source attribution, and context limits.
 
 ## Architecture
 
@@ -228,6 +229,27 @@ Mailpit is used only for local development. Production must use a real transacti
 
 Production still needs HTTPS at a reverse proxy, secret-manager integration, secure `HttpOnly` refresh-token cookies with CSRF protection, admin rate limiting, dependency/image scanning, and tested backup restoration.
 
+## Public API error contract
+
+Client and service failures use an abstract error hierarchy in
+`app/core/api_errors.py`. Public responses include a stable `detail` field for
+backward compatibility plus a structured `error` object:
+
+```json
+{
+  "detail": "Request contains invalid fields",
+  "error": {
+    "code": "validation_error",
+    "message": "Request contains invalid fields",
+    "fields": ["customer_email"]
+  }
+}
+```
+
+Validation handlers expose field locations but no Pydantic internals, values,
+provider payloads, SQL statements, or stack traces. Unexpected exceptions are
+logged internally and returned as generic `500 internal_error` responses.
+
 ## API reference
 
 ### Queries
@@ -282,6 +304,9 @@ Copy `.env.example` to `.env` and replace every placeholder with a secure value.
 | `AI_CACHE_LOCK_SECONDS` | `15` | No | Cache stampede lock TTL |
 | `QUERY_MODE` | `inline` | No | `inline` or `queued`; Compose uses `queued` |
 | `REFRESH_TOKEN_MINUTES` | `720` | No | Absolute refresh-token lifetime |
+| `TLS_FULLCHAIN_PATH` | `./certs/fullchain.pem` | Compose HTTPS | PEM certificate chain |
+| `TLS_PRIVATE_KEY_PATH` | `./certs/privkey.pem` | Compose HTTPS | PEM private key; never commit it |
+| `ALLOWED_HOSTS` | `localhost,127.0.0.1` | Production | Comma-separated public hostnames |
 | `EMAIL_DELIVERY_LEASE_SECONDS` | `120` | No | Email outbox lease duration |
 | `WORKER_ID` | hostname | No | Must be unique when scaling workers |
 | `SMTP_HOST` | `localhost` | No | SMTP host; Compose uses Mailpit |
@@ -295,7 +320,7 @@ Copy `.env.example` to `.env` and replace every placeholder with a secure value.
 
 ### Docker Compose
 
-Docker Compose starts PostgreSQL, Redis, Mailpit, the Alembic migration service, the API, and the dedicated worker.
+Docker Compose starts PostgreSQL, Redis, Mailpit, nginx TLS termination, the Alembic migration service, the API, and the dedicated worker.
 
 ```powershell
 docker compose up --build
@@ -303,10 +328,24 @@ docker compose up --build
 
 Endpoints:
 
-- API: `http://127.0.0.1:8765`
-- Health: `http://127.0.0.1:8765/healthz`
+- API: `https://127.0.0.1`
+- Health: `https://127.0.0.1/healthz`
+- HTTP redirect: `http://127.0.0.1` redirects to HTTPS
 - Mailpit UI: `http://127.0.0.1:8025`
 - SMTP: `127.0.0.1:1025`
+
+### TLS certificates
+
+Place a certificate chain and private key at `certs/fullchain.pem` and `certs/privkey.pem`, or set `TLS_FULLCHAIN_PATH` and `TLS_PRIVATE_KEY_PATH` to managed certificate paths. Use certificates issued for the actual public domain. Private key files and the `certs/` directory are excluded from Git.
+
+For local development with a self-signed certificate, generate one only for testing:
+
+```powershell
+New-Item -ItemType Directory -Force certs
+openssl req -x509 -nodes -days 30 -newkey rsa:2048 -keyout certs/privkey.pem -out certs/fullchain.pem -subj "/CN=localhost"
+```
+
+Self-signed certificates are not trusted by browsers or production clients. Production must use a CA-issued certificate and `ALLOWED_HOSTS` must contain only the approved domain names.
 
 Stop services while preserving volumes and database data:
 
@@ -360,6 +399,7 @@ Static diagnostics and `git diff --check` should also be run before committing.
 - Redis-backed distributed rate limiting and answer caching.
 - Durable worker queue and email outbox.
 - Alembic schema migrations through the current email-delivery lease migration.
+-Nginx TLS 1.2/1.3 reverse proxy with HTTP-to-HTTPS redirect, HSTS, and security headers.
 - Application ports and service layer for answer generation.
 - Structured logs, correlation IDs, timeout middleware, and security headers.
 
