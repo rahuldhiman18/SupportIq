@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.tables import KnowledgeAnswer, KnowledgeAnswerVersion, Order
+from app.services.business_policy import faq_context
 
 # ** Order-number extractor from free text: "status for ORD-9002" / "#A12345"
 _ORDER_NUMBER_RE = re.compile(r"\b#?([A-Za-z]{1,4}-?\d{4,8})\b")
@@ -90,7 +91,7 @@ def build_prompt_context(
     policy_context = "\n\n".join(
         f"Topic - {canonical_question}:\n{version.answer_text}"
         for version, canonical_question in current_policies
-    ) or None
+    ) or faq_context(question)
 
     # !Generate an intent-aware Ai response, grounded in the knowledge base
     # ** Phase 1: LIVE order facts (location algo) - real data beats guessing.

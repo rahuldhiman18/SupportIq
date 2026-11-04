@@ -7,8 +7,9 @@ from sqlalchemy.orm import Session
 
 from app.core.deps import get_db
 from app.models.tables import Order, OrderEvent
-from app.schemas.dto import OrderCreate, OrderTrackResponse
+from app.schemas.dto import OrderCreate, OrderTrackResponse, PolicyDecisionResponse
 from app.core.security import current_identity, require_admin_key, require_customer_identity
+from app.services.business_policy import evaluate_cancellation, evaluate_refund
 
 router = APIRouter(tags=["orders"])
 
@@ -74,3 +75,55 @@ def get_order(order_number: str, email: str | None = None,
         delivery_method=order.delivery_method,
         destination_city=order.destination_city,
     )
+
+
+def _owned_order(order_number: str, identity: dict | None, email: str | None,
+                 db: Session) -> Order:
+    """Load an order only inside the verified customer scope."""
+    production = os.getenv("APP_ENV", "production").lower() in {"prod", "production"}
+    effective_email = ((identity or {}).get("email") if production
+                       else (identity or {}).get("email") or email)
+    if not effective_email:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    order = db.execute(select(Order).where(
+        Order.order_number == order_number.strip().upper(),
+        Order.customer_email == effective_email,
+    )).scalars().first()
+    if order is None:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return order
+
+
+@router.get("/orders/{order_number}/refund-decision",
+            response_model=PolicyDecisionResponse)
+def refund_decision(order_number: str, email: str | None = None,
+                    db: Session = Depends(get_db),
+                    identity: dict | None = Depends(require_customer_identity)):
+    """Explain refund eligibility; this endpoint never moves money."""
+    order = _owned_order(order_number, identity, email, db)
+    decision = evaluate_refund(order)
+    return PolicyDecisionResponse(order_number=order.order_number,
+                                  decision=decision.decision,
+                                  reason_code=decision.reason_code,
+                                  message=decision.customer_message,
+                                  requires_human=decision.requires_human,
+                                  requires_confirmation=decision.requires_confirmation,
+                                  policy_version=decision.policy_version)
+
+
+@router.get("/orders/{order_number}/cancellation-decision",
+            response_model=PolicyDecisionResponse)
+def cancellation_decision(order_number: str, email: str | None = None,
+                          confirmed: bool = False,
+                          db: Session = Depends(get_db),
+                          identity: dict | None = Depends(require_customer_identity)):
+    """Explain cancellation eligibility; this endpoint never changes an order."""
+    order = _owned_order(order_number, identity, email, db)
+    decision = evaluate_cancellation(order, confirmed=confirmed)
+    return PolicyDecisionResponse(order_number=order.order_number,
+                                  decision=decision.decision,
+                                  reason_code=decision.reason_code,
+                                  message=decision.customer_message,
+                                  requires_human=decision.requires_human,
+                                  requires_confirmation=decision.requires_confirmation,
+                                  policy_version=decision.policy_version)

@@ -6,7 +6,9 @@ import os
 import time
 import hashlib
 import hmac
+import ipaddress
 import secrets
+import threading
 from collections import defaultdict
 
 from fastapi import HTTPException, Request
@@ -40,6 +42,7 @@ def get_db():
 _RATE_LIMIT = 30
 _RATE_WINDOW_SECONDS = 60.0
 _rate_hits: dict[str, list[float]] = defaultdict(list)
+_rate_lock = threading.Lock()
 
 _REDIS_LIMIT_SCRIPT = """
 local now = redis.call('TIME')
@@ -67,6 +70,35 @@ def _rate_limit_key(client_id: str) -> str:
         secret.encode("utf-8"), client_id.encode("utf-8"), hashlib.sha256
     ).hexdigest()
     return f"supportiq:ratelimit:v1:{digest}"
+
+
+def _is_production() -> bool:
+    return os.getenv("APP_ENV", "development").lower() in {"prod", "production"}
+
+
+def _trusted_client_id(request: Request) -> str:
+    """Use forwarding headers only from explicitly trusted reverse proxies."""
+    peer = request.client.host if request.client else "unknown"
+    trusted_proxies = {
+        value.strip() for value in os.getenv("TRUSTED_PROXY_IPS", "").split(",")
+        if value.strip()
+    }
+    forwarded = request.headers.get("x-forwarded-for")
+    candidate = forwarded.split(",", 1)[0].strip() if forwarded and peer in trusted_proxies else peer
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        # Never use a caller-controlled malformed forwarding header as a key.
+        return "unknown"
+
+
+def _require_production_rate_limit_config() -> None:
+    if not _is_production():
+        return
+    if not os.getenv("REDIS_URL"):
+        raise HTTPException(status_code=503, detail="Rate limiting temporarily unavailable")
+    if not (os.getenv("CACHE_KEY_SECRET") or os.getenv("JWT_SECRET_KEY")):
+        raise HTTPException(status_code=503, detail="Rate limiting temporarily unavailable")
 
 
 def _redis_client() -> Redis | None:
@@ -120,18 +152,20 @@ def _throttle_with_redis(client_id: str) -> None:
 
 
 def throttle_public_chat(request: Request) -> None:
-    ip = request.client.host if request.client else "unknown"
+    _require_production_rate_limit_config()
+    ip = _trusted_client_id(request)
     if _redis_client() is not None:
         _throttle_with_redis(ip)
         return
 
-    now = time.monotonic()
-    hits = [t for t in _rate_hits[ip] if now - t < _RATE_WINDOW_SECONDS]
-    _rate_hits[ip] = hits
-    if len(hits) >= _RATE_LIMIT:
-        raise HTTPException(
-            status_code=429,
-            detail="Too many requests - please wait a minute",
-            headers={"Retry-After": "60"},
-        )
-    hits.append(now)
+    with _rate_lock:
+        now = time.monotonic()
+        hits = [t for t in _rate_hits[ip] if now - t < _RATE_WINDOW_SECONDS]
+        _rate_hits[ip] = hits
+        if len(hits) >= _RATE_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many requests - please wait a minute",
+                headers={"Retry-After": "60"},
+            )
+        hits.append(now)

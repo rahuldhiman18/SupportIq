@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import threading
 from dataclasses import dataclass
 
 import httpx
@@ -20,6 +21,13 @@ from app.core.privacy import sanitize_for_ai
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+# Per-process overload guard. Redis-backed request throttling protects the
+# public edge; this guard protects provider capacity when many requests arrive
+# concurrently in one API worker. A distributed deployment should also set a
+# provider-level quota and keep QUERY_MODE=queued for sustained traffic.
+AI_CONCURRENCY_LIMIT = max(1, int(os.getenv("AI_CONCURRENCY_LIMIT", "8")))
+_AI_SLOTS = threading.BoundedSemaphore(AI_CONCURRENCY_LIMIT)
 
 # --- 1. Fail fast: crash at startup if key is missing,
 #         instead of failing mysteriously on every request ---
@@ -257,18 +265,23 @@ def _generate_once(question: str, *, json_mode: bool = False) -> types.GenerateC
 
 def _map_generate_errors(question: str, *, single_attempt: bool) -> str:
     """Shared typed-error mapping for 3-try and 1-try paths."""
+    if not _AI_SLOTS.acquire(blocking=False):
+        raise AIRateLimitError("AI concurrency limit reached")
     try:
-        response = _generate_once(question, json_mode=True) if single_attempt else _generate(question, json_mode=True)
-    except (TimeoutError, ConnectionError,
-            httpx.TimeoutException, httpx.ConnectError) as e:
-        raise AITimeoutError("AI provider timed out or connection failed") from e
-    except httpx.HTTPError as e:
-        raise AIProviderError("AI provider network error") from e
-    except APIError as e:
-        code = getattr(e, "code", None)
-        if code == 429:
-            raise AIRateLimitError("AI provider rate limit reached") from e
-        raise AIProviderError(f"AI provider error (status={code})") from e
+        try:
+            response = _generate_once(question, json_mode=True) if single_attempt else _generate(question, json_mode=True)
+        except (TimeoutError, ConnectionError,
+                httpx.TimeoutException, httpx.ConnectError) as e:
+            raise AITimeoutError("AI provider timed out or connection failed") from e
+        except httpx.HTTPError as e:
+            raise AIProviderError("AI provider network error") from e
+        except APIError as e:
+            code = getattr(e, "code", None)
+            if code == 429:
+                raise AIRateLimitError("AI provider rate limit reached") from e
+            raise AIProviderError(f"AI provider error (status={code})") from e
+    finally:
+        _AI_SLOTS.release()
 
     if not response.candidates:
         raise AIContentBlockedError("Response blocked by safety filters")

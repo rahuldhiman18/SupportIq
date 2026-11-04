@@ -66,6 +66,9 @@ class QueryResponse(BaseModel):
     status: str
     created_at:datetime
     intent: str | None = None
+    outcome: Literal["answered", "refused", "needs_human", "queued"] = "answered"
+    next_step: str | None = None
+    requires_human: bool = False
 
 class QueryStatus(str,Enum):
     PENDING = "pending"
@@ -146,3 +149,13 @@ class OrderTrackResponse(BaseModel):
     stalled: bool
     delivery_method: str
     destination_city: str
+
+
+class PolicyDecisionResponse(BaseModel):
+    order_number: str
+    decision: str
+    reason_code: str
+    message: str
+    requires_human: bool = False
+    requires_confirmation: bool = False
+    policy_version: str

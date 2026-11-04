@@ -19,6 +19,10 @@ from app.core.cache import answer_cache, build_answer_cache_key
 from app.models.tables import Feedback, SupportQuery, Support_Answer, compute_base_priority
 # Prompt-context builder shared by the inline and queued paths (Step 3b).
 from app.services.prompt_context import build_prompt_context
+from app.services.answer_behavior import (
+    preflight_customer_question,
+    validate_generated_answer,
+)
 from app.schemas.dto import (
     AnswerResponse, FeedbackCreate, FeedbackResponse, HumanAnswerRequest,
     QueryResponse, QueryUpdate, SupportRequest,
@@ -148,6 +152,21 @@ def create_query(request: SupportRequest, http_request: Request,
         db.commit()
         db.refresh(query)
 
+    preflight = preflight_customer_question(query.question)
+    if preflight is not None:
+        query.intent = "out_of_scope"
+        query.status = "resolved"
+        answer = Support_Answer(query_id=query.id, answer_text=preflight.answer_text or "")
+        db.add(answer)
+        db.commit()
+        return {
+            "query_id": query.id, "question": query.question,
+            "status": query.status, "created_at": query.created_at,
+            "intent": query.intent, "outcome": preflight.outcome,
+            "next_step": preflight.next_step,
+            "requires_human": preflight.requires_human,
+        }
+
     if _query_mode() == "queued":
         # ** Step 3b enqueue: NO AI call inside the request. Priority is
         #    server-derived (never client-sent): stalled carriers, verified
@@ -164,6 +183,9 @@ def create_query(request: SupportRequest, http_request: Request,
             "status": query.status,
             "created_at": query.created_at,
             "intent": query.intent,
+            "outcome": "queued",
+            "next_step": "Your request is queued for secure processing.",
+            "requires_human": False,
         }
 
     # ---- inline (Phase A behavior, unchanged; QUERY_MODE=inline default) ----
@@ -191,7 +213,21 @@ def create_query(request: SupportRequest, http_request: Request,
     except (AIContentBlockedError, AIProviderError):
         raise HTTPException(status_code=502, detail="Could not generate an answer right now")
 
-    generate_text = result.answer_text
+    behavior = validate_generated_answer(result.answer_text)
+    if behavior.requires_human:
+        query.intent = result.intent
+        query.status = "needs_human"
+        db.commit()
+        db.refresh(query)
+        return {
+            "query_id": query.id, "question": query.question,
+            "status": query.status, "created_at": query.created_at,
+            "intent": query.intent, "outcome": behavior.outcome,
+            "next_step": behavior.next_step,
+            "requires_human": True,
+        }
+
+    generate_text = behavior.answer_text or ""
     query.intent = result.intent
     query.status = "resolved"  # Step 4: inline AI resolution is final
     db.commit()
@@ -211,7 +247,10 @@ def create_query(request: SupportRequest, http_request: Request,
     "question": query.question,
     "status": query.status,
     "created_at": query.created_at,
-    "intent": query.intent
+    "intent": query.intent,
+    "outcome": behavior.outcome,
+    "next_step": behavior.next_step,
+    "requires_human": behavior.requires_human,
 }
 
 @router.get("/queries/{query_id}",response_model=QueryResponse)
