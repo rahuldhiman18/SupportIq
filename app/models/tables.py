@@ -1,6 +1,7 @@
 from uuid import UUID, uuid4
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String ,CheckConstraint,Index,UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, CheckConstraint, Index, UniqueConstraint
 from sqlalchemy.orm import Mapped , mapped_column, relationship
+from pgvector.sqlalchemy import Vector
 from app.core.database import Base
 from datetime import datetime, timezone, timedelta, date
 import threading
@@ -162,6 +163,56 @@ class KnowledgeAnswerVersion(Base):
               knowledge_answer_id,unique=True,
               postgresql_where = ((is_current.is_(True)))
     ),
+    )
+
+
+class KnowledgeChunk(Base):
+    """One immutable, approved-content chunk and its optional embedding."""
+
+    __tablename__ = "knowledge_chunks"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    knowledge_answer_id: Mapped[UUID] = mapped_column(
+        ForeignKey("knowledge_answers.id"), nullable=False
+    )
+    knowledge_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("knowledge_answer_versions.id"), nullable=False
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedding_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    embedding = mapped_column(Vector(), nullable=True)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint("chunk_index >= 0", name="ck_knowledge_chunks_index"),
+        CheckConstraint(
+            "length(content_hash) = 64",
+            name="ck_knowledge_chunks_content_hash_length",
+        ),
+        UniqueConstraint(
+            "knowledge_version_id",
+            "chunk_index",
+            name="uq_knowledge_chunks_version_index",
+        ),
+        Index(
+            "ix_knowledge_chunks_active_version",
+            "knowledge_version_id",
+            "is_active",
+        ),
+        Index(
+            "ix_knowledge_chunks_answer_version",
+            "knowledge_answer_id",
+            "knowledge_version_id",
+        ),
     )
 
 
@@ -395,5 +446,4 @@ class Feedback(Base):
     )
 
     query: Mapped["SupportQuery"] = relationship()
-
 

@@ -15,6 +15,29 @@ from sqlalchemy import text
 EXPECTED_INDEX = "ix_support_answers_query_id"
 
 
+def test_knowledge_chunks_schema_is_declared(db_session):
+    from app.models.tables import KnowledgeChunk
+
+    bind = db_session.get_bind()
+    table = KnowledgeChunk.__table__
+
+    assert {column.name for column in table.columns} >= {
+        "id",
+        "knowledge_answer_id",
+        "knowledge_version_id",
+        "chunk_index",
+        "content",
+        "content_hash",
+        "embedding_model",
+        "embedding",
+        "is_active",
+        "created_at",
+    }
+    assert "uq_knowledge_chunks_version_index" in {
+        constraint.name for constraint in table.constraints
+    }
+
+
 def test_support_answers_query_id_index_is_declared(db_session):
     bind = db_session.get_bind()
     if bind.dialect.name == "postgresql":

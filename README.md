@@ -36,6 +36,7 @@ SupportIq is an AI-powered customer-support backend built with FastAPI, PostgreS
 - PostgreSQL migrations managed by Alembic in a separate migration container.
 - Structured JSON logging, correlation IDs, security headers, and request timeouts.
 - LangGraph-based bounded AI workflow with no database or email side effects inside the graph.
+- PostgreSQL `pgvector` support and a versioned knowledge-chunk schema prepared for future RAG indexing.
 
 ## Architecture
 
