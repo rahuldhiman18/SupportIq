@@ -2,24 +2,25 @@
 
 SupportIq is an AI-powered customer-support backend built with FastAPI, PostgreSQL, Redis, and Google Gemini. It grounds answers in approved knowledge and verified order facts, supports inline and queued processing, and escalates unsafe or unresolved answers to human support.
 
-> **Current status:** staging-ready local deployment. The Docker Compose stack includes an HTTPS reverse proxy, but production still needs real certificates, a real email provider, worker health monitoring, backups, and observability.
+> **Current status:** staging-ready local deployment with live Gemini, RAG, pgvector, PostgreSQL, Redis, queued workers, and TLS documentation verified. AWS or another managed production platform still needs real certificates or a load balancer, a production SMTP provider, secret-manager integration, backups, observability, and worker autoscaling/monitoring.
 
 ## Contents
 
 1. [Capabilities](#capabilities)
 2. [Architecture](#architecture)
-3. [Application layer and abstractions](#application-layer-and-abstractions)
-4. [Folder structure](#folder-structure)
-5. [Query lifecycle](#query-lifecycle)
-6. [Queue and retry behavior](#queue-and-retry-behavior)
-7. [Email delivery](#email-delivery)
-8. [Redis, caching, and rate limiting](#redis-caching-and-rate-limiting)
-9. [Authentication and security](#authentication-and-security)
-10. [API reference](#api-reference)
-11. [Configuration](#configuration)
-12. [Running locally](#running-locally)
-13. [Testing](#testing)
-14. [Deployment status and remaining work](#deployment-status-and-remaining-work)
+3. [RAG retrieval pipeline](#rag-retrieval-pipeline)
+4. [Application layer and abstractions](#application-layer-and-abstractions)
+5. [Folder structure](#folder-structure)
+6. [Query lifecycle](#query-lifecycle)
+7. [Queue and retry behavior](#queue-and-retry-behavior)
+8. [Email delivery](#email-delivery)
+9. [Redis, caching, and rate limiting](#redis-caching-and-rate-limiting)
+10. [Authentication and security](#authentication-and-security)
+11. [API reference](#api-reference)
+12. [Configuration](#configuration)
+13. [Running locally](#running-locally)
+14. [Testing](#testing)
+15. [Deployment status and remaining work](#deployment-status-and-remaining-work)
 
 ## Capabilities
 
@@ -36,33 +37,65 @@ SupportIq is an AI-powered customer-support backend built with FastAPI, PostgreS
 - PostgreSQL migrations managed by Alembic in a separate migration container.
 - Structured JSON logging, correlation IDs, security headers, and request timeouts.
 - LangGraph-based bounded AI workflow with no database or email side effects inside the graph.
-- PostgreSQL `pgvector` support and a versioned knowledge-chunk schema prepared for future RAG indexing.
-- Hybrid retrieval abstractions for query embeddings, approved PostgreSQL vector/full-text search, tenant filtering, result merging, source attribution, and context limits.
+- PostgreSQL `pgvector` support with versioned, tenant-scoped knowledge chunks.
+- 768-dimensional Gemini document/query embeddings with RETRIEVAL_DOCUMENT and RETRIEVAL_QUERY task types.
+- Opt-in hybrid retrieval combining normalized cosine-vector and PostgreSQL full-text scores.
+- HNSW cosine search, approved/current/active knowledge filtering, source attribution, and context limits.
+- Knowledge draft creation and admin approval; approval can publish and index the current version.
+- STARTTLS and implicit SMTPS support, certificate verification, and production clear-text SMTP rejection.
 
 ## Architecture
 
 ```mermaid
-graph TD
-    Client[Frontend / Customer] -->|HTTPS / HTTP| Proxy[Reverse Proxy or Load Balancer]
-    Proxy --> API[FastAPI API]
-    API --> Auth[Auth and authorization]
-    API --> App[Application services]
-    App --> Context[Prompt context service]
-    Context --> DB[(PostgreSQL)]
-    App --> Cache[Answer cache port]
+flowchart LR
+    Client[Customer or frontend] -->|HTTPS| Proxy[nginx or cloud load balancer]
+    Proxy --> API[FastAPI API replicas]
+
+    subgraph Application["SupportIq application"]
+        API --> Auth[JWT and admin authorization]
+        API --> Query[Query and knowledge routes]
+        Query --> Context[Prompt context builder]
+        Query --> Answer[Answer generation service]
+        Answer --> Cache[Cache service]
+        Context --> RAG[RAG retriever]
+        Answer --> Graph[Bounded answer graph]
+    end
+
     Cache --> Redis[(Redis)]
-    App --> AI[AI provider port]
-    AI --> Gemini[Google Gemini]
+    RAG --> Embed[Gemini query embedding]
+    RAG --> PgVector[(PostgreSQL + pgvector)]
+    Context --> DB[(PostgreSQL)]
+    Graph --> Gemini[Google Gemini]
     API --> Queue[(support_queries)]
-    Queue --> Worker[Dedicated worker service]
-    Worker --> Graph[Bounded answer graph]
-    Graph --> AI
+    Queue --> Worker[Dedicated worker replicas]
+    Worker --> Graph
     Worker --> Outbox[(email_outbox)]
-    Outbox --> SMTP[SMTP provider / Mailpit]
-    Migrate[Migration service] -->|alembic upgrade head| DB
+    Outbox --> SMTP[TLS SMTP provider or Mailpit]
+    Migration[Alembic migration job] -->|upgrade head| DB
 ```
 
-The API process does not run the worker loop. Docker Compose starts the migration service first, then starts the API and worker services against the same PostgreSQL database.
+The API process does not run the worker loop. Docker Compose starts migrations first, then starts API and worker services against the same PostgreSQL database.
+
+### AWS deployment shape
+
+```mermaid
+flowchart TD
+    Users[Customers and frontend] -->|HTTPS 443| ALB[Application Load Balancer]
+    ALB --> API[ECS or EKS API service]
+    API --> RDS[(Amazon RDS PostgreSQL with pgvector)]
+    API --> Redis[(ElastiCache Redis)]
+    API --> Secrets[Secrets Manager / KMS]
+    API --> SMTP[SES or production SMTP]
+
+    Worker[ECS or EKS worker service] --> RDS
+    Worker --> Redis
+    Worker --> Gemini[Google Gemini API]
+    API --> Gemini
+    Migration[Alembic migration task] --> RDS
+    CloudWatch[CloudWatch logs, metrics, alarms] --> API
+    CloudWatch --> Worker
+    CloudWatch --> RDS
+```
 
 ### HTTP request composition
 
@@ -77,6 +110,35 @@ flowchart LR
     Infra --> Response[Public DTO response]
 ```
 
+## RAG retrieval pipeline
+
+```mermaid
+flowchart TD
+    Draft[Admin creates knowledge draft] --> Review[Versioned review and approval]
+    Review -->|approved + current + active| Publish[Publish article version]
+    Publish --> Chunk[Fixed-size text chunker]
+    Chunk --> EmbedDoc[768-D Gemini RETRIEVAL_DOCUMENT embedding]
+    EmbedDoc --> Index[(Tenant-scoped pgvector knowledge chunks)]
+
+    Question[Customer question] --> QueryEmbed[768-D Gemini RETRIEVAL_QUERY embedding]
+    QueryEmbed --> Vector[Cosine vector candidates]
+    Question --> FTS[PostgreSQL full-text candidates]
+    Vector --> Merge[Weighted score normalization and merge]
+    FTS --> Merge
+    Merge --> Tenant[Tenant approval/current/active filters]
+    Tenant --> Sources[Top sources + source attribution]
+    Sources --> Prompt[Grounded policy and live-order prompt]
+    Prompt --> Gemini[Gemini generation and answer validation]
+    Gemini --> Answer[Validated customer answer or human handoff]
+```
+
+- RAG is opt-in with `RAG_ENABLED=true`.
+- Existing approved-policy and FAQ behavior remains a fallback when retrieval fails.
+- The database never returns unapproved, inactive, wrong-tenant, or non-current chunks.
+- Vector and full-text candidates are merged so semantic and exact-policy matches complement each other.
+- The same prompt-context builder is used by inline and queued paths, keeping answer inputs consistent.
+- Retrieved source metadata is retained for attribution and knowledge-version tracking.
+
 ## Application layer and abstractions
 
 The application layer hides infrastructure details from routes and workers.
@@ -86,6 +148,12 @@ The application layer hides infrastructure details from routes and workers.
 | `AIAnswerer` port | Defines the provider contract without coupling workflows to Gemini. |
 | `AnswerCachePort` | Defines cache and locking behavior without exposing Redis operations. |
 | `AnswerGenerationService` | Owns cache keys, cache reads/writes, stampede locks, and answer generation. |
+| `TextChunker` protocol | Defines replaceable document chunking behavior. |
+| `DocumentEmbeddingGenerator` protocol | Defines document-vector adapter behavior independent of Gemini. |
+| `KnowledgeChunkIndexer` protocol | Defines tenant-scoped chunk replacement and indexing behavior. |
+| `QueryEmbeddingGenerator` protocol | Defines query-vector generation behavior independent of Gemini. |
+| `KnowledgeStore` protocol | Defines vector/full-text retrieval without coupling the service to SQLAlchemy. |
+| `KnowledgeRetriever` protocol | Defines provider-independent hybrid retrieval and source attribution. |
 | `WorkerTask` protocol | Allows the worker runtime to run replaceable task implementations. |
 | `run_support_graph` | Encapsulates generate → plan → validate → resolve/handoff behavior. |
 | DTO schemas | Keep public API contracts separate from SQLAlchemy models. |
@@ -124,6 +192,8 @@ supportiq/
 │       ├── agent_graph.py           # Bounded AI workflow
 │       ├── ai_service.py            # Gemini adapter and typed errors
 │       ├── mail.py                  # Durable email outbox and SMTP adapter
+│       ├── knowledge_indexing.py    # Chunking, document embeddings, pgvector writes
+│       ├── knowledge_retrieval.py   # Query embeddings, hybrid retrieval, score merge
 │       ├── prompt_context.py        # Knowledge and order grounding
 │       └── worker.py                # Queue claim, retry, reaper, runtime
 ├── tests/                           # Offline unit and integration tests
@@ -147,6 +217,7 @@ sequenceDiagram
     F->>A: POST /queries
     A->>D: Persist support query
     alt QUERY_MODE=inline
+        A->>D: Build tenant-scoped RAG prompt context
         A->>G: Generate grounded answer
         G-->>A: Typed answer
         A->>D: Persist answer + resolved status
@@ -154,6 +225,7 @@ sequenceDiagram
         A-->>F: 202 + resolved result
     else QUERY_MODE=queued
         A->>D: Set status=queued
+        A->>D: Save prompt context inputs and tenant scope
         A-->>F: 202 + query_id
         loop Poll status
             W->>D: Claim one row with SKIP LOCKED
@@ -200,6 +272,8 @@ The `email_outbox` table is the durable source of truth for outbound resolution 
 - Workers claim rows with a short database transaction before calling SMTP.
 - Stale leases are recoverable after the delivery lease expires.
 - A deterministic `Message-ID` is generated from the idempotency key.
+- SMTP supports STARTTLS and implicit SMTPS.
+- TLS certificate verification is enabled; production rejects clear-text SMTP when `SMTP_REQUIRE_TLS=true`.
 - Raw SMTP is still technically at-least-once if a process crashes after SMTP accepts a message but before the database is updated. A provider with idempotency-key support is required for stronger exactly-once behavior.
 
 Mailpit is used only for local development. Production must use a real transactional email provider with TLS, credentials, bounce monitoring, and provider-side idempotency support.
@@ -282,6 +356,7 @@ logged internally and returned as generic `500 internal_error` responses.
 | POST | `/orders` | Create order and events; admin key |
 | GET | `/orders/{order_number}` | Read authenticated order tracking |
 | POST | `/knowledge` | Create a draft knowledge answer; admin key |
+| POST | `/knowledge/{knowledge_answer_id}/versions/{version_id}/approve` | Approve and optionally index a knowledge version; admin key |
 
 The frontend must support `queued`, `processing`, `resolved`, `needs_human`, and `closed` states. In queued mode, it should poll `/queries/{query_id}` and request `/queries/{query_id}/answer` after resolution.
 
@@ -394,7 +469,16 @@ Tests are designed to run offline with SQLite and mocked AI behavior.
 python -m pytest -q
 ```
 
-The latest verified run passed 126 tests. Coverage includes API behavior, authentication and refresh-token rotation, privacy, queue claims and reaping, worker lifecycle substitution, AI graph validation, email outbox behavior, application-service ports, and health endpoints.
+The latest verified run passed **217 tests**. Coverage includes API behavior, authentication and refresh-token rotation, privacy, tenant isolation, queue claims and reaping, worker lifecycle substitution, AI graph validation, email outbox behavior, knowledge chunking/indexing, RAG retrieval, application-service ports, and health endpoints.
+
+Live Docker verification has also confirmed:
+
+- PostgreSQL migrations reach Alembic head `b3c4d5e6f7a8`.
+- pgvector is enabled and HNSW cosine indexing is available.
+- Nine approved policy articles are indexed with 768-dimensional embeddings.
+- A normal Gemini answer correctly uses the 30-day refund policy.
+- A prompt-injection attempt requesting secrets is refused without exposing credentials.
+- `/readyz` returns HTTP `200` when the live stack is ready.
 
 Static diagnostics and `git diff --check` should also be run before committing.
 
@@ -407,20 +491,28 @@ Static diagnostics and `git diff --check` should also be run before committing.
 - PostgreSQL health-gated migrations.
 - Redis-backed distributed rate limiting and answer caching.
 - Durable worker queue and email outbox.
-- Alembic schema migrations through the current email-delivery lease migration.
--Nginx TLS 1.2/1.3 reverse proxy with HTTP-to-HTTPS redirect, HSTS, and security headers.
+- Alembic schema migrations through RAG head `b3c4d5e6f7a8`.
+- Separate `/livez` and `/readyz` health endpoints.
+- pgvector chunk storage, tenant-aware hybrid retrieval, and HNSW cosine indexing.
+- 768-dimensional Gemini document and query embeddings.
+- Knowledge draft approval with optional document indexing.
+- STARTTLS and implicit SMTPS support with production clear-text rejection.
+- Nginx TLS 1.2/1.3 reverse proxy with HTTP-to-HTTPS redirect, HSTS, and security headers.
 - Application ports and service layer for answer generation.
 - Structured logs, correlation IDs, timeout middleware, and security headers.
 
 ### Required before production
 
 - Replace Mailpit with a production transactional email provider.
-- Add HTTPS reverse proxy or cloud load balancer.
 - Add CORS configuration for the deployed frontend origin.
-- Add separate liveness and readiness probes.
+- Configure and verify real certificate paths for the public domain.
 - Enable worker healthchecks and unique worker IDs when scaling.
 - Add PostgreSQL backups and a tested restore procedure.
 - Add metrics, centralized logs, queue alerts, and provider failure alerts.
+- Add retrieval-quality datasets and tune the similarity threshold.
+- Add retry or dead-letter handling for knowledge-vector indexing failures.
+- Add cross-tenant live retrieval and real PostgreSQL embedding checks to staging.
+- Add AWS infrastructure-as-code and managed-service configuration.
 - Move secrets to a managed secret store.
 - Add frontend integration tests and normalize error responses.
 - Protect refresh-token rotation with a database row lock for concurrent refresh requests.
@@ -432,4 +524,4 @@ Private / internal use.
 
 ---
 
-*Last updated: 2026-11-03*
+*Last updated: 2026-11-06*
