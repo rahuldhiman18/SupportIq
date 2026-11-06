@@ -188,7 +188,7 @@ class KnowledgeChunk(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     embedding_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    embedding = mapped_column(Vector(), nullable=True)
+    embedding = mapped_column(Vector(768), nullable=True)
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False
     )

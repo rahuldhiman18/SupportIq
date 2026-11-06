@@ -304,6 +304,8 @@ Copy `.env.example` to `.env` and replace every placeholder with a secure value.
 | `DB_MAX_OVERFLOW` | `40` | No | PostgreSQL overflow connections per API process |
 | `CORS_ALLOWED_ORIGINS` | empty | Production frontend | Exact comma-separated origins; no wildcard default |
 | `CORS_ALLOW_CREDENTIALS` | `false` | No | Allow credentials for configured CORS origins |
+| `RAG_ENABLED` | `false` | No | Enable tenant-scoped vector/hybrid knowledge retrieval |
+| `EMBEDDING_MODEL` | `gemini-embedding-001` | No | Gemini embedding model used for documents and queries |
 | `AI_CACHE_TTL_SECONDS` | `600` | No | Successful answer cache TTL |
 | `AI_CACHE_LOCK_SECONDS` | `15` | No | Cache stampede lock TTL |
 | `QUERY_MODE` | `inline` | No | `inline` or `queued`; Compose uses `queued` |

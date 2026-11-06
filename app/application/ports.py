@@ -97,3 +97,31 @@ class KnowledgeStore(Protocol):
         limit: int,
     ) -> list[RetrievedSource]:
         ...
+
+
+class DocumentEmbeddingGenerator(Protocol):
+    """Generates embedding vectors for knowledge documents."""
+
+    def generate(self, text: str) -> list[float]:
+        ...
+
+
+class TextChunker(Protocol):
+    """Splits approved knowledge into bounded chunks."""
+
+    def chunk(self, text: str) -> list[str]:
+        ...
+
+
+class KnowledgeChunkIndexer(Protocol):
+    """Indexes approved knowledge versions as immutable chunks."""
+
+    def index_version(
+        self,
+        *,
+        knowledge_answer_id: UUID,
+        knowledge_version_id: UUID,
+        tenant_id: str | None,
+        content: str,
+    ) -> int:
+        ...

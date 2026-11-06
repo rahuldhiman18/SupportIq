@@ -90,6 +90,7 @@ class KnowledgeCreate(BaseModel):
     canonical_question :str = Field(min_length=1 , max_length=500)
     answer_text:str = Field(min_length=1 , max_length=5000)
     source_url:str = Field(min_length = 1, max_length= 2000)
+    tenant_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 class KnowledgeDraftResponse(BaseModel):
     knowledge_answer_id : UUID

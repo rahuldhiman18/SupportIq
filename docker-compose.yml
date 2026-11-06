@@ -8,6 +8,8 @@ x-supportiq-environment: &supportiq-environment
   APP_ENV: production
   DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-supportiq}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-supportiq}
   QUERY_MODE: queued
+  RAG_ENABLED: ${RAG_ENABLED:-false}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-gemini-embedding-001}
   REDIS_URL: redis://redis:6379/0
   CACHE_KEY_SECRET: ${CACHE_KEY_SECRET:?set CACHE_KEY_SECRET in .env}
   AI_CACHE_TTL_SECONDS: ${AI_CACHE_TTL_SECONDS:-600}

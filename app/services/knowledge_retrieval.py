@@ -41,7 +41,10 @@ class GeminiQueryEmbeddingGenerator(QueryEmbeddingGenerator):
         response = self._client.models.embed_content(
             model=EMBEDDING_MODEL,
             contents=question.strip(),
-            config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
+            config=types.EmbedContentConfig(
+                task_type="RETRIEVAL_QUERY",
+                output_dimensionality=768,
+            ),
         )
         embeddings = getattr(response, "embeddings", None) or []
         if not embeddings or not getattr(embeddings[0], "values", None):

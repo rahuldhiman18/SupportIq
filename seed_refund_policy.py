@@ -8,6 +8,7 @@ POST /queries combines them (labeled by topic) into the single AI prompt.
 """
 
 from datetime import datetime, timezone
+import os
 
 from sqlalchemy import func, select
 
@@ -146,6 +147,27 @@ ARTICLES = {
 }
 
 
+def _index_current_version_if_enabled(db, knowledge, version) -> int:
+    if os.getenv("RAG_ENABLED", "false").lower() != "true":
+        return 0
+    from app.services.knowledge_indexing import (
+        FixedSizeTextChunker,
+        GeminiDocumentEmbeddingGenerator,
+        PostgreSQLKnowledgeChunkIndexer,
+    )
+
+    return PostgreSQLKnowledgeChunkIndexer(
+        db,
+        chunker=FixedSizeTextChunker(),
+        embedding_generator=GeminiDocumentEmbeddingGenerator(),
+    ).index_version(
+        knowledge_answer_id=knowledge.id,
+        knowledge_version_id=version.id,
+        tenant_id=knowledge.tenant_id,
+        content=version.answer_text,
+    )
+
+
 def _ensure_article(db, canonical_question: str, answer_text: str,
                     source_url: str) -> str:
     """Create the article, or publish a new approved version if it changed."""
@@ -164,7 +186,8 @@ def _ensure_article(db, canonical_question: str, answer_text: str,
             )
         ).scalars().first()
         if current and current.answer_text == answer_text:
-            return f"up to date : {canonical_question}"
+            indexed = _index_current_version_if_enabled(db, knowledge, current)
+            return f"up to date: {canonical_question} (indexed {indexed} chunks)"
         knowledge.is_active = True
         knowledge.source_url = source_url
     else:
@@ -197,7 +220,11 @@ def _ensure_article(db, canonical_question: str, answer_text: str,
     )
     db.add(version)
     db.commit()
-    return f"seeded v{version.version_number}: {canonical_question}"
+    indexed = _index_current_version_if_enabled(db, knowledge, version)
+    return (
+        f"seeded v{version.version_number}: {canonical_question}"
+        f" (indexed {indexed} chunks)"
+    )
 
 
 def seed() -> None:

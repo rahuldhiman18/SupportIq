@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.tables import KnowledgeAnswer, KnowledgeAnswerVersion, Order
+from app.application.ports import RetrievedSource, RetrievalRequest
 from app.services.business_policy import faq_context
 
 # ** Order-number extractor from free text: "status for ORD-9002" / "#A12345"
@@ -45,6 +46,7 @@ class PromptContext:
     situation: str | None
     knowledge_version_id: UUID | None
     stalled: bool
+    retrieved_sources: tuple[RetrievedSource, ...] = ()
     # Agent-style resolution (approved): the order the server auto-matched for
     # a logged-in customer with exactly one open order. Persisted on the query
     # at enqueue time so queued workers rebuild the same facts without a JWT.
@@ -63,6 +65,38 @@ def build_prompt_context(
     tenant_id: str | None = None,
 ) -> PromptContext:
     """Build policy + situation context exactly as inline mode always did."""
+    retrieved_sources: tuple[RetrievedSource, ...] = ()
+    retrieval_context: str | None = None
+
+    # RAG retrieval is opt-in for staged rollout. Retrieval failures fall back
+    # to the complete approved-policy join below; never expose unapproved text.
+    if os.getenv("RAG_ENABLED", "false").lower() == "true":
+        try:
+            from app.services.knowledge_retrieval import (
+                GeminiQueryEmbeddingGenerator,
+                HybridKnowledgeRetriever,
+                PostgreSQLKnowledgeStore,
+            )
+
+            retriever = HybridKnowledgeRetriever(
+                embedding_generator=GeminiQueryEmbeddingGenerator(),
+                store=PostgreSQLKnowledgeStore(db),
+            )
+            retrieval = retriever.retrieve(
+                RetrievalRequest(
+                    question=question,
+                    tenant_id=tenant_id,
+                )
+            )
+            retrieved_sources = retrieval.sources
+            if retrieval.context.strip():
+                retrieval_context = retrieval.context
+        except Exception:
+            # Provider or database retrieval outage deliberately uses the
+            # approved-policy fallback rather than failing customer traffic.
+            retrieved_sources = ()
+            retrieval_context = None
+
     # ** Find ALL current approved knowledge versions (source of truth), each
     #    labeled with its topic so the AI grounds in the RIGHT policy.
     #    (The old code used .first() which picked ONE arbitrary policy once
@@ -85,13 +119,22 @@ def build_prompt_context(
     ).all()
 
     # schema allows one FK per query: first topic (alphabetical) is primary
-    knowledge_version_id = current_policies[0][0].id if current_policies else None
+    knowledge_version_id = (
+        retrieved_sources[0].knowledge_version_id
+        if retrieved_sources
+        else current_policies[0][0].id
+        if current_policies
+        else None
+    )
 
     # One combined, labeled policy block keeps the single AI call fast.
-    policy_context = "\n\n".join(
-        f"Topic - {canonical_question}:\n{version.answer_text}"
-        for version, canonical_question in current_policies
-    ) or faq_context(question)
+    policy_context = retrieval_context or (
+        "\n\n".join(
+            f"Topic - {canonical_question}:\n{version.answer_text}"
+            for version, canonical_question in current_policies
+        )
+        or faq_context(question)
+    )
 
     # !Generate an intent-aware Ai response, grounded in the knowledge base
     # ** Phase 1: LIVE order facts (location algo) - real data beats guessing.
@@ -194,4 +237,5 @@ def build_prompt_context(
         knowledge_version_id=knowledge_version_id,
         stalled=stalled,
         resolved_order_number=resolved_order_number,
+        retrieved_sources=retrieved_sources,
     )
