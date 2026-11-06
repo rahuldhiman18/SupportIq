@@ -32,6 +32,12 @@ def test_healthz_needs_no_admin_key(client, monkeypatch):
     assert r.status_code == 200
 
 
+def test_liveness_and_readiness_separate(client, monkeypatch):
+    monkeypatch.setattr("app.core.health.check_gemini", lambda: False)
+    assert client.get("/livez").status_code == 200
+    assert client.get("/readyz").status_code == 200
+
+
 def test_healthz_503_when_db_down(client):
     from sqlalchemy.exc import OperationalError
 

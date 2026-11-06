@@ -300,6 +300,10 @@ Copy `.env.example` to `.env` and replace every placeholder with a secure value.
 | `ADMIN_API_KEY` | — | No | Admin key; absent means fail closed |
 | `CACHE_KEY_SECRET` | — | Yes with Redis | HMAC secret for cache/rate-limit keys |
 | `REDIS_URL` | — | No locally | Redis URL for distributed cache and limiting |
+| `DB_POOL_SIZE` | `20` | No | PostgreSQL persistent pool size per API process |
+| `DB_MAX_OVERFLOW` | `40` | No | PostgreSQL overflow connections per API process |
+| `CORS_ALLOWED_ORIGINS` | empty | Production frontend | Exact comma-separated origins; no wildcard default |
+| `CORS_ALLOW_CREDENTIALS` | `false` | No | Allow credentials for configured CORS origins |
 | `AI_CACHE_TTL_SECONDS` | `600` | No | Successful answer cache TTL |
 | `AI_CACHE_LOCK_SECONDS` | `15` | No | Cache stampede lock TTL |
 | `QUERY_MODE` | `inline` | No | `inline` or `queued`; Compose uses `queued` |
@@ -313,6 +317,9 @@ Copy `.env.example` to `.env` and replace every placeholder with a secure value.
 | `SMTP_PORT` | `1025` | No | SMTP port |
 | `SMTP_USER` | empty | No | SMTP username |
 | `SMTP_PASSWORD` | empty | No | SMTP password |
+| `SMTP_USE_TLS` | `true` when user/password is set | No | Upgrade an SMTP connection with STARTTLS |
+| `SMTP_USE_SSL` | `false` | No | Use implicit SMTPS (typically port 465) |
+| `SMTP_REQUIRE_TLS` | `true` in production | No | Reject SMTP delivery unless STARTTLS or SMTPS is enabled |
 | `MAIL_FROM` | `support@supportiq.local` | No | Sender address |
 | `MAIL_FROM_NAME` | `SupportIq` | No | Sender display name |
 

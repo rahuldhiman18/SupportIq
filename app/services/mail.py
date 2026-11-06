@@ -14,6 +14,7 @@ import os
 import hashlib
 import socket
 import smtplib
+import ssl
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formataddr
@@ -34,6 +35,13 @@ SMTP_HOST = os.getenv("SMTP_HOST", "localhost")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "1025"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true" if SMTP_USER else "false").lower() == "true"
+SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "false").lower() == "true"
+_APP_ENV = os.getenv("APP_ENV", "development").lower()
+SMTP_REQUIRE_TLS = os.getenv(
+    "SMTP_REQUIRE_TLS",
+    "true" if _APP_ENV in {"prod", "production"} else "false",
+).lower() == "true"
 MAIL_FROM = os.getenv("MAIL_FROM", "support@supportiq.local")
 MAIL_FROM_NAME = os.getenv("MAIL_FROM_NAME", "SupportIq")
 DELIVERY_LEASE_SECONDS = int(os.getenv("EMAIL_DELIVERY_LEASE_SECONDS", "120"))
@@ -49,6 +57,12 @@ def _send_smtp(
     idempotency_key: str | None = None,
 ) -> None:
     """Deliver one email via SMTP.  Raises on failure (caller records it)."""
+    if SMTP_REQUIRE_TLS and not (SMTP_USE_TLS or SMTP_USE_SSL):
+        raise RuntimeError("TLS is required for SMTP in production")
+    if SMTP_USE_TLS and SMTP_USE_SSL:
+        raise RuntimeError("Configure either SMTP_USE_TLS or SMTP_USE_SSL, not both")
+
+    tls_context = ssl.create_default_context()
     msg = EmailMessage()
     msg["From"] = formataddr((MAIL_FROM_NAME, MAIL_FROM))
     msg["To"] = to
@@ -61,9 +75,20 @@ def _send_smtp(
         msg["Message-ID"] = f"<supportiq-{digest}@supportiq.local>"
     msg.set_content(body_text)
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as smtp:
+    if SMTP_USE_SSL:
+        smtp_connection = smtplib.SMTP_SSL(
+            SMTP_HOST,
+            SMTP_PORT,
+            timeout=10,
+            context=tls_context,
+        )
+    else:
+        smtp_connection = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
+
+    with smtp_connection as smtp:
+        if SMTP_USE_TLS and not SMTP_USE_SSL:
+            smtp.starttls(context=tls_context)
         if SMTP_USER:
-            smtp.starttls()
             smtp.login(SMTP_USER, SMTP_PASSWORD)
         smtp.send_message(msg)
 

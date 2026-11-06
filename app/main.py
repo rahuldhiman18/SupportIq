@@ -11,6 +11,7 @@ Dependency direction (no cycles):
   main      -> api/v1/*, services.worker
 """
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 import os
 
@@ -55,13 +56,37 @@ from app.api.v1.queries import answer_customer_question  # noqa: F401
 # Configure structured JSON logging before anything else logs.
 setup_logging()
 
-app = FastAPI(title="SupportIq")
+_app_env = os.getenv("APP_ENV", "development").lower()
+_is_production = _app_env in {"prod", "production"}
+
+app = FastAPI(
+    title="SupportIq",
+    docs_url=None if _is_production else "/docs",
+    redoc_url=None if _is_production else "/redoc",
+    openapi_url=None if _is_production else "/openapi.json",
+)
 register_api_exception_handlers(app)
+
+# CORS is opt-in and has no wildcard-origin default. Production callers must
+# set CORS_ALLOWED_ORIGINS to the exact frontend origins.
+_cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=os.getenv("CORS_ALLOW_CREDENTIALS", "false").lower() == "true",
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Admin-Key"],
+    )
 
 # Production deployments must only accept approved public hostnames. Keep
 # development/test hosts unrestricted so offline TestClient suite behavior is
 # unchanged.
-if os.getenv("APP_ENV", "development").lower() in {"prod", "production"}:
+if _is_production:
     _allowed_hosts = [
         host.strip()
         for host in os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")

@@ -32,10 +32,12 @@ USER appuser
 
 EXPOSE 8000
 
-# HEALTHCHECK = the /healthz we built (open, 3 strings, DB ping -> 503).
+# HEALTHCHECK = process liveness (/livez); deployment readiness uses /readyz
+# separately because external provider outages must not remove API processes
+# solely for inability to reach Gemini.
 # interval 30s | timeout 5s | start_period gives alembic time on first boot.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status==200 else 1)"
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/livez', timeout=4).status==200 else 1)"
 
 # The image is used by separate migrate, API, and worker services. The
 # deployment layer owns migration ordering and process selection.

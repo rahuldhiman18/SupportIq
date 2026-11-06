@@ -18,8 +18,8 @@ if not DATABASE_URL:
 _POOL_KWARGS = {}
 if DATABASE_URL and not DATABASE_URL.startswith("sqlite"):
     _POOL_KWARGS = {
-        "pool_size": 20,        # persistent connections kept ready
-        "max_overflow": 40,     # extra connections under burst traffic
+        "pool_size": int(os.getenv("DB_POOL_SIZE", "20")),
+        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "40")),
         "pool_timeout": 30,     # seconds to wait for a free conn before 503
         "pool_recycle": 1800,   # recycle after 30 min so idle conns don't go stale
         "pool_pre_ping": True,  # test conn before use; avoids "server closed

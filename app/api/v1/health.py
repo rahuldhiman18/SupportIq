@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.deps import _query_mode, get_db
-from app.core.health import check_health
+from app.core.health import check_database, check_health
 from app.core.security import require_admin_key
 from app.models.tables import SupportQuery
 from app.services import worker as _worker
@@ -43,6 +43,20 @@ def healthz(db: Session = Depends(get_db)):
     if not all(components.values()):
         raise HTTPException(status_code=503, detail="degraded")
     return {"status": "ok"}
+
+
+@router.get("/livez")
+def livez():
+    """Process liveness: always proves the HTTP process is serving."""
+    return {"status": "ok"}
+
+
+@router.get("/readyz")
+def readyz(db: Session = Depends(get_db)):
+    """Readiness: only require dependencies needed to serve API traffic."""
+    if not check_database(db):
+        raise HTTPException(status_code=503, detail="not ready")
+    return {"status": "ready"}
 
 
 @router.get("/admin/queue-stats")
